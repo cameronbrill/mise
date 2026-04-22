@@ -1,0 +1,21 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.1",
+  "base_commit_sha": "b688bff080eb6ae73e49a90994aa66475df5875a",
+  "prompts": {
+    "b608727a58968ac9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a5632b5d-b53b-4c06-a148-4bbbff06fa8f",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Cameron Brill",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 25,
+      "accepted_lines": 0,
+      "overriden_lines": 0
+    }
+  }
+}
