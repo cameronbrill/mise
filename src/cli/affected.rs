@@ -185,7 +185,7 @@ impl Affected {
             let tasks = config
                 .tasks_with_context(Some(&TaskLoadContext::all()))
                 .await
-                .wrap_err("could not load tasks for --target filter")?;
+                .wrap_err_with(|| "could not load tasks for --target filter")?;
             let mut keepers: BTreeSet<ProjectId> = BTreeSet::new();
             for task in tasks.values() {
                 if !task.is_match(target) {
