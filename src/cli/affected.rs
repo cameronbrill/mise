@@ -409,6 +409,39 @@ mod tests {
         Arc::new(ProjectGraph::new(root))
     }
 
+    /// Insta snapshot of the `AffectedReport` JSON shape. Locks the
+    /// `mise affected --format json` wire contract so any field
+    /// rename/removal surfaces as a PR-time diff. Mirrors the wire
+    /// snapshot in `src/project/wire.rs::tests`.
+    #[test]
+    fn affected_report_json_snapshot_with_target() {
+        let report = AffectedReport {
+            schema: AFFECTED_REPORT_SCHEMA,
+            version: 1,
+            base: "main".into(),
+            head: "HEAD".into(),
+            projects: vec!["//apps/api".into(), "//apps/web".into()],
+            target_tasks: Some(vec![
+                "//apps/api:build".into(),
+                "//apps/web:build".into(),
+            ]),
+        };
+        insta::assert_json_snapshot!(&report);
+    }
+
+    #[test]
+    fn affected_report_json_snapshot_without_target() {
+        let report = AffectedReport {
+            schema: AFFECTED_REPORT_SCHEMA,
+            version: 1,
+            base: "main".into(),
+            head: "HEAD".into(),
+            projects: vec!["//libs/shared".into()],
+            target_tasks: None,
+        };
+        insta::assert_json_snapshot!(&report);
+    }
+
     #[test]
     fn resolve_user_files_strips_monorepo_root_for_relative_paths() {
         let tmp = tempfile::tempdir().unwrap();

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Integration test for the consolidated expand_config_roots_inner.
+# Mixes a mise.toml-based project, a project.json-only project (no
+# mise.toml — exercised only via the foreign-reader path), and an
+# explicit non-existent path. `mise affected` must:
+#   - find the mise project (apps/web) when its file changes
+#   - find the foreign-reader-only project (apps/api) when its file
+#     changes (regression check for has_mise_config over-filter)
+#   - skip the missing path without aborting the whole run
+set -e
+export MISE_EXPERIMENTAL=1
+
+git -c init.defaultBranch=main init -q .
+git config user.email test@test.com
+git config user.name "Test"
+
+cat <<'TOML' >mise.toml
+experimental_monorepo_root = true
+[monorepo]
+config_roots = ["apps/*", "missing"]
+TOML
+
+mkdir -p apps/web apps/api
+
+# apps/web has a mise.toml — picked up by both the task system AND
+# the project-graph mise reader.
+cat <<'TOML' >apps/web/mise.toml
+[project]
+name = "web"
+sources = ["**/*.ts"]
+TOML
+
+# apps/api has NO mise.toml — only a project.json. This is the
+# load-bearing case for expand_config_roots_unfiltered: without the
+# unfiltered path, `has_mise_config` would drop apps/api silently.
+cat <<'JSON' >apps/api/project.json
+{"name":"api","tags":["backend"]}
+JSON
+
+git add -A
+git commit -qm "initial"
+git checkout -qb feature
+
+fail() { echo "FAIL: $1" >&2; exit 1; }
+
+# Change a file in apps/api (project.json-only project).
+echo "// changed" >apps/api/src.ts
+git add -A
+git commit -qm "api change"
+
+echo "=== Change in project.json-only project should be detected ==="
+out=$(mise affected --base main --head HEAD)
+echo "$out"
+echo "$out" | grep -qx "//apps/api" || fail "apps/api not detected (project.json-only project should still produce a project graph entry)"
+
+# Reset and change apps/web instead.
+git checkout -q main
+git checkout -qb feature2
+echo "// changed" >apps/web/src.ts
+git add -A
+git commit -qm "web change"
+
+echo "=== Change in mise-config project should be detected ==="
+out=$(mise affected --base main --head HEAD)
+echo "$out"
+echo "$out" | grep -qx "//apps/web" || fail "apps/web not detected"
+
+echo "=== Mixed-formats config_roots test passed ==="
