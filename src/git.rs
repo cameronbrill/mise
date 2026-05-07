@@ -56,9 +56,26 @@ impl Git {
     }
 
     pub fn is_repo(&self) -> bool {
-        // `.git` is a directory in normal repos but a regular file in
-        // worktrees and submodules. `exists()` covers both. (F-19)
-        self.dir.join(".git").exists()
+        // Delegate to git itself so the check works for repos rooted
+        // anywhere up the directory tree (nested-monorepo layouts where
+        // `.git` lives above `self.dir`) and for worktrees/submodules
+        // (where `.git` is a regular file rather than a directory).
+        let safe = format!("safe.directory={}", self.dir.display());
+        cmd!(
+            "git",
+            "-C",
+            &self.dir,
+            "-c",
+            &safe,
+            "rev-parse",
+            "--is-inside-work-tree",
+        )
+        .stdout_capture()
+        .stderr_null()
+        .unchecked()
+        .run()
+        .map(|r| r.status.success())
+        .unwrap_or(false)
     }
 
     /// Return true when `<dir>/.git` is a directory (the local-clone
@@ -617,5 +634,139 @@ mod tests {
             s.gix = Some(backups.0);
             s.libgit2 = Some(backups.1);
         });
+    }
+
+    /// Helper: run git from a directory, asserting success.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn make_repo_with_commits(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git_in(dir, &["-c", "init.defaultBranch=main", "init", "-q"]);
+        git_in(
+            dir,
+            &[
+                "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "-q", "--allow-empty", "-m", "first",
+            ],
+        );
+    }
+
+    /// Regression for round-2 F-r2-2: `is_repo()` must walk up the
+    /// directory tree (matches `git -C <dir>` behavior). The previous
+    /// implementation only checked `<dir>/.git`, returning false for
+    /// any subdirectory of a real repo.
+    #[test]
+    fn is_repo_finds_parent_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_repo_with_commits(tmp.path());
+        let nested = tmp.path().join("apps/web");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(
+            Git::new(&nested).is_repo(),
+            "is_repo should walk up to find the .git directory"
+        );
+    }
+
+    #[test]
+    fn is_repo_false_for_non_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No `git init`; is_repo must return false.
+        assert!(!Git::new(tmp.path()).is_repo());
+    }
+
+    #[test]
+    fn rev_parse_verify_resolves_existing_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_repo_with_commits(tmp.path());
+        let git = Git::new(tmp.path());
+        let sha = git.rev_parse_verify("HEAD").unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(git.rev_parse_verify("main").is_ok());
+    }
+
+    #[test]
+    fn rev_parse_verify_errs_on_missing_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_repo_with_commits(tmp.path());
+        assert!(Git::new(tmp.path()).rev_parse_verify("nope").is_err());
+    }
+
+    #[test]
+    fn merge_base_finds_common_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_repo_with_commits(tmp.path());
+        let dir = tmp.path();
+        let base_sha = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        // Branch and add a commit on each side.
+        git_in(dir, &["checkout", "-q", "-b", "feature"]);
+        git_in(
+            dir,
+            &[
+                "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "-q", "--allow-empty", "-m", "feature",
+            ],
+        );
+        let mb = Git::new(dir).merge_base("main", "HEAD").unwrap();
+        assert_eq!(mb, base_sha);
+    }
+
+    #[test]
+    fn changed_files_reports_committed_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_repo_with_commits(tmp.path());
+        let dir = tmp.path();
+        git_in(dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        git_in(dir, &["add", "a.txt"]);
+        git_in(
+            dir,
+            &[
+                "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "-q", "-m", "add a",
+            ],
+        );
+        let changed = Git::new(dir).changed_files("main", "HEAD", false).unwrap();
+        assert!(changed.iter().any(|p| p.ends_with("a.txt")), "got: {changed:?}");
+    }
+
+    #[test]
+    fn changed_files_includes_untracked_when_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_repo_with_commits(tmp.path());
+        let dir = tmp.path();
+        std::fs::write(dir.join("untracked.txt"), "u").unwrap();
+        let with_uncommitted = Git::new(dir)
+            .changed_files("HEAD", "HEAD", true)
+            .unwrap();
+        assert!(
+            with_uncommitted.iter().any(|p| p.ends_with("untracked.txt")),
+            "expected untracked file when include_uncommitted=true; got: {with_uncommitted:?}"
+        );
+        let without = Git::new(dir).changed_files("HEAD", "HEAD", false).unwrap();
+        assert!(
+            !without.iter().any(|p| p.ends_with("untracked.txt")),
+            "untracked file should not appear when include_uncommitted=false; got: {without:?}"
+        );
     }
 }
