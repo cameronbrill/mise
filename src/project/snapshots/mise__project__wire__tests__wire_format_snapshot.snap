@@ -1,0 +1,42 @@
+---
+source: src/project/wire.rs
+expression: "&wire"
+---
+{
+  "schema": "mise-project-graph-experimental",
+  "version": 1,
+  "monorepo_root": "/tmp/mono",
+  "projects": [
+    {
+      "id": "//apps/web",
+      "root": "apps/web",
+      "source": "nx",
+      "sources": [
+        "src/**/*.ts"
+      ],
+      "tags": [
+        "frontend"
+      ],
+      "foreign_names": {
+        "npm-workspace": "@org/web",
+        "nx": "web-shell"
+      }
+    },
+    {
+      "id": "//libs/shared",
+      "root": "libs/shared",
+      "source": "npm-workspace",
+      "sources": [],
+      "tags": [],
+      "foreign_names": {
+        "npm-workspace": "@org/shared"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "//apps/web",
+      "to": "//libs/shared"
+    }
+  ]
+}

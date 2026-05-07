@@ -22,6 +22,8 @@ cargo-flamegraph.trace
 
 # Snapcraft
 *.snap
+# But keep insta snapshots — they live under */snapshots/ and lock test wire formats.
+!**/snapshots/*.snap
 
 # alpine
 .ash_history
