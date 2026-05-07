@@ -387,7 +387,7 @@ impl Git {
     /// Verify a git ref exists, returning its resolved sha.
     pub fn rev_parse_verify(&self, refname: &str) -> Result<String> {
         // `--end-of-options` so an attacker-controlled ref starting with
-        // `--` is treated as a positional arg rather than a flag. (F-1)
+        // `--` is treated as a positional arg rather than a flag.
         Ok(
             git_cmd_read!(&self.dir, "rev-parse", "--verify", "--end-of-options", refname)?
                 .trim()
@@ -409,7 +409,7 @@ impl Git {
     /// Files changed between `base` and `head` according to git. Output
     /// paths are relative to `self.dir` (the monorepo root) — the
     /// `--relative` flag handles the case where the repo's `.git`
-    /// directory is above `self.dir` (nested-monorepo layouts). (F-2)
+    /// directory is above `self.dir` (nested-monorepo layouts).
     /// Includes committed changes plus, when `include_uncommitted` is
     /// true, uncommitted-and-untracked working-tree changes.
     pub fn changed_files(
