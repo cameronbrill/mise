@@ -1,7 +1,3 @@
-// Some items are consumed only by future PRs (mise graph CLI command).
-// Mark as allowed-dead so PR 1 builds cleanly.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -16,8 +12,12 @@ use super::{ProjectGraph, ProjectId, ProjectSource};
 /// contributions are exercised. Graduates to `mise-project-graph-v1` in a
 /// later PR (see workpad "Wire format graduation timing"). Consumers
 /// should pin against `mise --version` while the schema is experimental.
+//
+// Allow-dead because the consumer (`mise graph` CLI) ships in a follow-up PR.
+#[allow(dead_code)]
 pub const WIRE_SCHEMA_EXPERIMENTAL: &str = "mise-project-graph-experimental";
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub struct WireProjectGraph {
     pub schema: &'static str,
@@ -27,6 +27,7 @@ pub struct WireProjectGraph {
     pub edges: Vec<WireEdge>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub struct WireProject {
     pub id: ProjectId,
@@ -37,6 +38,7 @@ pub struct WireProject {
     pub foreign_names: BTreeMap<ProjectSource, String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 pub struct WireEdge {
     pub from: ProjectId,
@@ -109,8 +111,8 @@ mod tests {
             PathBuf::from("m"),
             ProjectSource::Mise,
         ));
-        g.add_edge(&"//z".into(), &"//a".into());
-        g.add_edge(&"//m".into(), &"//a".into());
+        g.add_edge("//z", "//a");
+        g.add_edge("//m", "//a");
         let wire: WireProjectGraph = (&g).into();
         let ids: Vec<&str> = wire.projects.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["//a", "//m", "//z"]);

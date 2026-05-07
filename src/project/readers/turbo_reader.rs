@@ -1,14 +1,10 @@
-// MARKERS / parse / TurboJson are referenced in collect_projects/edges
-// but rustc's dead-code analyzer doesn't track usage through serde.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use eyre::Result;
 use serde::Deserialize;
 
-use super::{DEFAULT_WALK_DEPTH, walk_for_markers};
+use super::{DEFAULT_WALK_DEPTH, read_optional_file, walk_for_markers};
 use crate::project::ProjectSource;
 use crate::project::reader::{
     ContributedEdge, ContributedProject, EdgeEndpoint, MonorepoConfigReader, ResolutionView,
@@ -38,12 +34,18 @@ struct PipelineEntry {
 const MARKERS: &[&str] = &["turbo.json"];
 
 impl TurboReader {
-    fn parse(path: &Path) -> Result<Option<TurboJson>> {
-        let body = match std::fs::read_to_string(path) {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
-        };
-        Ok(serde_json::from_str(&body).ok())
+    fn parse(path: &Path) -> Option<TurboJson> {
+        let body = read_optional_file(path, "turbo")?;
+        match serde_json::from_str::<TurboJson>(&body) {
+            Ok(parsed) => Some(parsed),
+            Err(e) => {
+                warn!(
+                    "project reader 'turbo': could not parse {}: {e}",
+                    path.display()
+                );
+                None
+            }
+        }
     }
 }
 
@@ -62,7 +64,7 @@ impl MonorepoConfigReader for TurboReader {
                 continue;
             }
             let path = dir.join("turbo.json");
-            if Self::parse(&path)?.is_none() {
+            if Self::parse(&path).is_none() {
                 continue;
             }
             // Use the directory name as the foreign-name fallback when
@@ -82,6 +84,15 @@ impl MonorepoConfigReader for TurboReader {
         Ok(out)
     }
 
+    /// Per pipeline entry, emit edges for `<pkg>#<task>` references that
+    /// resolve against npm/pnpm workspace names. The `^build` form (which
+    /// means "transitive deps' build") is intentionally ignored — those
+    /// edges come from the workspace dependency traversal in the
+    /// npm/pnpm readers.
+    ///
+    /// Note: at the root pipeline level we don't know which project
+    /// owns the entry, so the edge attribution is approximate. This is
+    /// documented in the PR description and tracked as future work.
     fn collect_edges(
         &self,
         monorepo_root: &Path,
@@ -89,60 +100,93 @@ impl MonorepoConfigReader for TurboReader {
     ) -> Result<Vec<ContributedEdge>> {
         let mut out = Vec::new();
         let root_turbo = monorepo_root.join("turbo.json");
-        let Some(turbo) = Self::parse(&root_turbo)? else {
+        let Some(turbo) = Self::parse(&root_turbo) else {
             return Ok(out);
         };
-        // For each pipeline entry, parse `<pkg>#<task>` dependencies. The
-        // `^build` syntax (transitive deps via package.json) is intentionally
-        // ignored here — those edges come from the npm/pnpm reader's
-        // `dependencies` traversal.
         for entry in turbo.pipeline.values() {
             for dep in &entry.depends_on {
-                if let Some(hash) = dep.find('#') {
-                    let pkg = &dep[..hash];
-                    if pkg.is_empty() || pkg.starts_with('^') {
-                        continue;
-                    }
-                    // Edges flow in both directions until we know which
-                    // package this pipeline entry belongs to. Resolve the
-                    // referenced package against npm-workspace names.
-                    if let Some(target) = view
-                        .resolve(&EdgeEndpoint::ForeignName {
-                            source: ProjectSource::NpmWorkspace,
+                let Some(hash) = dep.find('#') else { continue };
+                let pkg = &dep[..hash];
+                if pkg.is_empty() || pkg.starts_with('^') {
+                    continue;
+                }
+                let Some(target) = view
+                    .resolve(&EdgeEndpoint::ForeignName {
+                        source: ProjectSource::NpmWorkspace,
+                        name: pkg.to_string(),
+                    })
+                    .or_else(|| {
+                        view.resolve(&EdgeEndpoint::ForeignName {
+                            source: ProjectSource::PnpmWorkspace,
                             name: pkg.to_string(),
                         })
-                        .or_else(|| {
-                            view.resolve(&EdgeEndpoint::ForeignName {
-                                source: ProjectSource::PnpmWorkspace,
-                                name: pkg.to_string(),
-                            })
-                        })
-                    {
-                        // The "from" side is unknown without a project
-                        // context; turbo cross-package references at the
-                        // root pipeline level imply every package depends
-                        // on the named one. Add an edge from each
-                        // pnpm/npm-managed project to the target.
-                        for project in view.projects_by_source(&ProjectSource::NpmWorkspace) {
-                            if project.id != target {
-                                out.push(ContributedEdge {
-                                    from: EdgeEndpoint::Id(project.id.clone()),
-                                    to: EdgeEndpoint::Id(target.clone()),
-                                });
-                            }
-                        }
-                        for project in view.projects_by_source(&ProjectSource::PnpmWorkspace) {
-                            if project.id != target {
-                                out.push(ContributedEdge {
-                                    from: EdgeEndpoint::Id(project.id.clone()),
-                                    to: EdgeEndpoint::Id(target.clone()),
-                                });
-                            }
+                    })
+                else {
+                    continue;
+                };
+                for source in
+                    [ProjectSource::NpmWorkspace, ProjectSource::PnpmWorkspace].iter()
+                {
+                    for project in view.projects_by_source(source) {
+                        if project.id != target {
+                            out.push(ContributedEdge {
+                                from: EdgeEndpoint::Id(project.id.clone()),
+                                to: EdgeEndpoint::Id(target.clone()),
+                            });
                         }
                     }
                 }
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_extracts_pipeline_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("turbo.json");
+        std::fs::write(
+            &path,
+            r#"{"pipeline":{"build":{"dependsOn":["^build","shared#build"]}}}"#,
+        )
+        .unwrap();
+        let parsed = TurboReader::parse(&path).unwrap();
+        let entry = parsed.pipeline.get("build").unwrap();
+        assert_eq!(entry.depends_on, vec!["^build", "shared#build"]);
+    }
+
+    #[test]
+    fn parse_supports_tasks_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("turbo.json");
+        // Turbo 2.x uses `tasks` instead of `pipeline`.
+        std::fs::write(
+            &path,
+            r#"{"tasks":{"build":{"dependsOn":["shared#build"]}}}"#,
+        )
+        .unwrap();
+        let parsed = TurboReader::parse(&path).unwrap();
+        assert!(parsed.pipeline.contains_key("build"));
+    }
+
+    #[test]
+    fn collect_projects_skips_root_turbo_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("turbo.json"), r#"{"pipeline":{}}"#).unwrap();
+        std::fs::create_dir_all(tmp.path().join("apps/web")).unwrap();
+        std::fs::write(
+            tmp.path().join("apps/web/turbo.json"),
+            r#"{"pipeline":{}}"#,
+        )
+        .unwrap();
+        let projects = TurboReader.collect_projects(tmp.path()).unwrap();
+        // Root turbo.json is skipped; only apps/web becomes a project.
+        assert_eq!(projects.len(), 1);
+        assert!(projects[0].path_root.ends_with("apps/web"));
     }
 }

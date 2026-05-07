@@ -3,7 +3,7 @@ use std::path::Path;
 use eyre::Result;
 use serde::Deserialize;
 
-use super::{DEFAULT_WALK_DEPTH, walk_for_markers};
+use super::{DEFAULT_WALK_DEPTH, read_optional_file, walk_for_markers};
 use crate::project::ProjectSource;
 use crate::project::reader::{
     ContributedEdge, ContributedProject, EdgeEndpoint, MonorepoConfigReader, ResolutionView,
@@ -34,12 +34,18 @@ struct ProjectJson {
 const MARKERS: &[&str] = &["project.json"];
 
 impl NxReader {
-    fn parse(path: &Path) -> Result<Option<ProjectJson>> {
-        let body = match std::fs::read_to_string(path) {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
-        };
-        Ok(serde_json::from_str(&body).ok())
+    fn parse(path: &Path) -> Option<ProjectJson> {
+        let body = read_optional_file(path, "nx")?;
+        match serde_json::from_str::<ProjectJson>(&body) {
+            Ok(parsed) => Some(parsed),
+            Err(e) => {
+                warn!(
+                    "project reader 'nx': could not parse {}: {e}",
+                    path.display()
+                );
+                None
+            }
+        }
     }
 }
 
@@ -52,7 +58,7 @@ impl MonorepoConfigReader for NxReader {
         let mut out = Vec::new();
         for dir in walk_for_markers(monorepo_root, MARKERS, DEFAULT_WALK_DEPTH)? {
             let path = dir.join("project.json");
-            let Some(parsed) = Self::parse(&path)? else {
+            let Some(parsed) = Self::parse(&path) else {
                 continue;
             };
             let mut sources = Vec::new();
@@ -78,7 +84,7 @@ impl MonorepoConfigReader for NxReader {
         let mut out = Vec::new();
         for dir in walk_for_markers(monorepo_root, MARKERS, DEFAULT_WALK_DEPTH)? {
             let path = dir.join("project.json");
-            let Some(parsed) = Self::parse(&path)? else {
+            let Some(parsed) = Self::parse(&path) else {
                 continue;
             };
             let from = EdgeEndpoint::Path(dir);
@@ -98,5 +104,59 @@ impl MonorepoConfigReader for NxReader {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_extracts_name_and_implicit_deps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("project.json");
+        std::fs::write(
+            &path,
+            r#"{"name":"web","tags":["frontend"],"implicitDependencies":["shared","!ignored"],"sourceRoot":"apps/web/src"}"#,
+        )
+        .unwrap();
+        let parsed = NxReader::parse(&path).unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("web"));
+        assert_eq!(parsed.tags, vec!["frontend"]);
+        assert_eq!(parsed.implicit_dependencies, vec!["shared", "!ignored"]);
+        assert_eq!(parsed.source_root.as_deref(), Some("apps/web/src"));
+    }
+
+    #[test]
+    fn parse_handles_missing_file() {
+        assert!(NxReader::parse(Path::new("/nonexistent/project.json")).is_none());
+    }
+
+    #[test]
+    fn parse_tolerates_malformed_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("project.json");
+        std::fs::write(&path, "{not json}").unwrap();
+        assert!(NxReader::parse(&path).is_none());
+    }
+
+    #[test]
+    fn collect_edges_skips_negate_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("apps/web")).unwrap();
+        std::fs::write(
+            tmp.path().join("apps/web/project.json"),
+            r#"{"name":"web","implicitDependencies":["shared","!ignored"]}"#,
+        )
+        .unwrap();
+        let graph = crate::project::ProjectGraph::new(tmp.path().to_path_buf());
+        let view = ResolutionView::new(&graph);
+        let edges = NxReader.collect_edges(tmp.path(), &view).unwrap();
+        // Only one edge — the negate-prefixed one is skipped.
+        assert_eq!(edges.len(), 1);
+        match &edges[0].to {
+            EdgeEndpoint::ForeignName { name, .. } => assert_eq!(name, "shared"),
+            other => panic!("expected ForeignName, got {other:?}"),
+        }
     }
 }

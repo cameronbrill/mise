@@ -1,6 +1,7 @@
 use std::path::Path;
 
-use eyre::Result;
+use eyre::{Result, WrapErr};
+use petgraph::algo::tarjan_scc;
 
 use super::reader::{MonorepoConfigReader, ResolutionView};
 use super::{Project, ProjectGraph, project_id_from_path};
@@ -27,10 +28,20 @@ pub fn build_project_graph(
 
     // Pass 1 — collect projects.
     for reader in readers {
+        let reader_id = reader.id();
         let contributions = reader
             .collect_projects(monorepo_root)
-            .map_err(|e| e.wrap_err(format!("project reader '{}'", reader.id())))?;
+            .with_context(|| format!("project reader '{reader_id}'"))?;
         for contrib in contributions {
+            // Reject contributions whose path escapes the monorepo —
+            // produces nonsense ids and pollutes the name_index. (F-32)
+            if contrib.path_root.strip_prefix(monorepo_root).is_err() {
+                warn!(
+                    "project reader '{reader_id}' contributed path {} outside monorepo root — skipping",
+                    contrib.path_root.display()
+                );
+                continue;
+            }
             let id = project_id_from_path(monorepo_root, &contrib.path_root);
             let mut project = Project::new(id, contrib.path_root, contrib.source.clone());
             if let Some(name) = contrib.foreign_name {
@@ -46,14 +57,30 @@ pub fn build_project_graph(
     let snapshot = graph.clone();
     let view = ResolutionView::new(&snapshot);
     for reader in readers {
+        let reader_id = reader.id();
         let edges = reader
             .collect_edges(monorepo_root, &view)
-            .map_err(|e| e.wrap_err(format!("project reader '{}' edges", reader.id())))?;
+            .with_context(|| format!("project reader '{reader_id}' edges"))?;
         for edge in edges {
             let (Some(from), Some(to)) = (view.resolve(&edge.from), view.resolve(&edge.to)) else {
+                trace!(
+                    "project reader '{reader_id}': dropped unresolvable edge from={:?} to={:?}",
+                    edge.from, edge.to
+                );
                 continue;
             };
             graph.add_edge(&from, &to);
+        }
+    }
+
+    // Cycles are user-fixable but should be visible. (F-31)
+    if graph.has_cycle() {
+        for component in tarjan_scc(&graph.graph).into_iter().filter(|c| c.len() > 1) {
+            let ids: Vec<&str> = component
+                .iter()
+                .map(|idx| graph.graph[*idx].id.as_str())
+                .collect();
+            warn!("project graph cycle detected among {ids:?}");
         }
     }
 
@@ -181,11 +208,13 @@ mod tests {
         assert_eq!(graph.graph.edge_count(), 0);
     }
 
-    /// Adversarial test: a real on-disk monorepo with `nx.json`,
-    /// `project.json`, `package.json` workspaces, `pnpm-workspace.yaml`,
-    /// and `mise.toml` `[project]` tables, with cross-format references.
+    /// Adversarial test for the load-bearing AC11 mitigation: a real
+    /// on-disk monorepo with `nx.json`, `project.json`, `package.json`
+    /// workspaces, **and** `turbo.json`, with cross-format references.
     /// Verifies the two-pass builder + `name_index` resolves edges that
-    /// reference projects by name (not path) across formats.
+    /// reference projects by name (not path) across formats. Asserts
+    /// exact set + edge_count so a fan-out bug in any reader (e.g.,
+    /// turbo's coarse cross-package edges) would fail the test.
     #[test]
     fn multi_format_coexist_resolves_cross_format_edges() {
         let tmp = tempfile::tempdir().unwrap();
@@ -207,7 +236,7 @@ mod tests {
 
         // /libs/shared is an Nx project named "shared-lib" AND an npm
         // workspace package "@org/shared". Cross-format identity:
-        // foreign_names["nx"] = "shared-lib", foreign_names["npm"] = "@org/shared".
+        // foreign_names[Nx] = "shared-lib", foreign_names[NpmWorkspace] = "@org/shared".
         std::fs::create_dir_all(root.join("libs/shared")).unwrap();
         std::fs::write(
             root.join("libs/shared/project.json"),
@@ -237,40 +266,58 @@ mod tests {
         )
         .unwrap();
 
+        // Root turbo.json with a pipeline entry that references a
+        // workspace package by its `package.json` name. The turbo
+        // reader resolves this via the npm-workspace name_index.
+        std::fs::write(
+            root.join("turbo.json"),
+            r#"{"pipeline":{"build":{"dependsOn":["@org/shared#build"]}}}"#,
+        )
+        .unwrap();
+
         let graph = build_project_graph(root, &default_readers()).unwrap();
 
         // All three projects should be present.
         let ids: BTreeSet<String> = graph.projects().map(|p| p.id.clone()).collect();
-        assert!(ids.contains("//apps/web"), "got: {ids:?}");
-        assert!(ids.contains("//apps/api"), "got: {ids:?}");
-        assert!(ids.contains("//libs/shared"), "got: {ids:?}");
+        let expected_ids: BTreeSet<String> = ["//apps/web", "//apps/api", "//libs/shared"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(ids, expected_ids, "unexpected project set");
 
-        // /libs/shared should carry foreign names from both nx and npm.
-        let shared = graph.project(&"//libs/shared".to_string()).unwrap();
+        // /libs/shared should carry foreign names from nx AND npm AND
+        // implicitly via turbo's pipeline reference.
+        let shared = graph.project("//libs/shared").unwrap();
         assert_eq!(
-            shared.foreign_names.get(&ProjectSource::Nx).map(|s| s.as_str()),
+            shared.foreign_names.get(&ProjectSource::Nx).map(String::as_str),
             Some("shared-lib")
         );
         assert_eq!(
             shared
                 .foreign_names
                 .get(&ProjectSource::NpmWorkspace)
-                .map(|s| s.as_str()),
+                .map(String::as_str),
             Some("@org/shared")
         );
 
-        // Cross-format edge: api (nx) → shared (resolved via nx name).
+        // Cross-format edges: api (nx) → shared, web (npm) → shared.
         let affected_by_shared = graph.transitive_dependents(&["//libs/shared".into()]);
         assert!(
             affected_by_shared.contains("//apps/api"),
             "api should be a dependent of shared via the nx implicit edge; got {affected_by_shared:?}"
         );
-
-        // npm workspaces edge: @org/web → @org/shared (resolved via npm name).
         assert!(
             affected_by_shared.contains("//apps/web"),
             "web should be a dependent of shared via the npm dependency; got {affected_by_shared:?}"
         );
+
+        // Exact set check — fan-out bugs (extra edges) would fail this.
+        assert_eq!(affected_by_shared, expected_ids);
+
+        // No incoming edges to api: changing api shouldn't affect anything else.
+        let affected_by_api = graph.transitive_dependents(&["//apps/api".into()]);
+        let just_api: BTreeSet<String> = ["//apps/api".to_string()].into_iter().collect();
+        assert_eq!(affected_by_api, just_api);
     }
 
     #[test]

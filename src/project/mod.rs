@@ -7,22 +7,19 @@ pub mod reader;
 pub mod readers;
 pub mod wire;
 
-// `pub use` re-exports for downstream PR consumers (mise affected, mise graph).
-// Marked allow-unused so PR 1 builds cleanly before those land.
-#[allow(unused_imports)]
-pub use builder::{build_project_graph, default_readers};
 pub use graph::ProjectGraph;
-#[allow(unused_imports)]
-pub use reader::{ContributedEdge, ContributedProject, MonorepoConfigReader};
-#[allow(unused_imports)]
-pub use wire::{WIRE_SCHEMA_EXPERIMENTAL, WireProjectGraph};
+pub use reader::MonorepoConfigReader;
 
-/// Build the project graph for `monorepo_root` using the default reader
-/// set. Gated by `Settings::ensure_experimental("project-graph")`.
-pub fn build_default_graph(monorepo_root: &std::path::Path) -> eyre::Result<ProjectGraph> {
-    crate::config::Settings::get().ensure_experimental("project-graph")?;
-    build_project_graph(monorepo_root, &default_readers())
-}
+// Internal-only re-exports. ContributedEdge/ContributedProject and the
+// wire format types are stable surface for downstream PRs (project-graph
+// plugin protocol, `mise graph`) but no consumer references them through
+// `crate::project::*` yet, so re-exporting `pub use` would generate
+// unused-import warnings.
+pub(crate) use builder::{build_project_graph, default_readers};
+#[allow(unused_imports)]
+pub(crate) use reader::{ContributedEdge, ContributedProject};
+#[allow(unused_imports)]
+pub(crate) use wire::{WIRE_SCHEMA_EXPERIMENTAL, WireProjectGraph};
 
 /// Canonical identifier for a project.
 ///
@@ -37,6 +34,8 @@ pub type ProjectId = String;
 /// `name_index` on `ProjectGraph`, since most foreign formats reference
 /// projects by name rather than path.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ProjectSource {
     Mise,
     Nx,
@@ -67,6 +66,7 @@ impl std::fmt::Display for ProjectSource {
 /// populates `foreign_names` during pass 1 and consults the graph's
 /// `name_index` during pass 2 to resolve edges.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Project {
     pub id: ProjectId,
     pub root: PathBuf,
@@ -95,13 +95,13 @@ pub fn project_id_from_path(monorepo_root: &std::path::Path, project_root: &std:
     let rel = project_root
         .strip_prefix(monorepo_root)
         .unwrap_or(project_root);
-    let mut normalized = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
-    // Strip a leading separator so we don't end up with `///abs/path` when
+    let normalized = rel
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    // Strip leading separators so we don't end up with `///abs/path` when
     // `project_root` is absolute and outside the monorepo root (the
     // strip_prefix fallback case).
-    while normalized.starts_with('/') {
-        normalized.remove(0);
-    }
+    let normalized = normalized.trim_start_matches('/');
     if normalized.is_empty() || normalized == "." {
         "//".to_string()
     } else {

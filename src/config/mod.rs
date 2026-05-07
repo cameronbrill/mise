@@ -424,13 +424,16 @@ impl Config {
     }
 
     /// Build the project graph for the current monorepo. Returns
-    /// `Ok(None)` if there is no monorepo root configured. Gated by
-    /// `Settings::ensure_experimental("project-graph")`.
-    pub fn project_graph(&self) -> Result<Option<crate::project::ProjectGraph>> {
+    /// `Ok(None)` when there is no monorepo root. The experimental
+    /// gate fires here (and only here) so callers without a monorepo
+    /// don't see the experimental error.
+    pub fn project_graph(&self) -> Result<Option<Arc<crate::project::ProjectGraph>>> {
         let Some(root) = self.monorepo_root() else {
             return Ok(None);
         };
-        Ok(Some(crate::project::build_default_graph(&root)?))
+        Settings::get().ensure_experimental("project-graph")?;
+        let graph = crate::project::build_project_graph(&root, &crate::project::default_readers())?;
+        Ok(Some(Arc::new(graph)))
     }
 
     pub async fn tasks(&self) -> Result<Arc<BTreeMap<String, Task>>> {

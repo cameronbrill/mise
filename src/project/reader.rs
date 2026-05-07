@@ -1,7 +1,3 @@
-// `projects_by_source`, `project`, `names_for` are consumed by PR 2-5
-// commands. Allow dead-code so PR 1 builds cleanly.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -17,6 +13,7 @@ use super::{ProjectId, ProjectSource};
 /// or the `package.json` `name` field for npm/pnpm) used by other readers
 /// to refer to this project.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ContributedProject {
     pub source: ProjectSource,
     pub path_root: PathBuf,
@@ -30,15 +27,18 @@ pub struct ContributedProject {
 /// References to other projects are by `(ProjectSource, name)` pairs,
 /// resolved against the graph's `name_index` populated in pass 1. If a
 /// reference cannot be resolved (e.g., the target project doesn't exist
-/// in the graph), the edge is dropped silently — readers shouldn't fail
-/// the whole build because one cross-reference is wrong.
+/// in the graph), the edge is dropped with a `trace!` log — readers
+/// shouldn't fail the whole build because one cross-reference is wrong,
+/// but the user needs a way to see typo'd dependencies during debugging.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ContributedEdge {
     pub from: EdgeEndpoint,
     pub to: EdgeEndpoint,
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum EdgeEndpoint {
     /// The project at this absolute path. Resolved by exact-path match.
     Path(PathBuf),
@@ -115,10 +115,15 @@ impl<'a> ResolutionView<'a> {
             .filter(move |p| &p.source == source)
     }
 
+    /// Look up a project by canonical id. Used by future plugin readers.
+    #[allow(dead_code)]
     pub fn project(&self, id: &ProjectId) -> Option<&super::Project> {
         self.graph.project(id)
     }
 
+    /// All foreign-name → id mappings for a single source. Used by future
+    /// plugin readers that want to enumerate all known names.
+    #[allow(dead_code)]
     pub fn names_for(&self, source: &ProjectSource) -> BTreeMap<String, ProjectId> {
         let mut map = BTreeMap::new();
         for p in self.graph.projects() {

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use eyre::Result;
 use serde::Deserialize;
 
+use super::{is_safe_glob_pattern, read_optional_file};
 use crate::project::ProjectSource;
 use crate::project::reader::{
     ContributedEdge, ContributedProject, EdgeEndpoint, MonorepoConfigReader, ResolutionView,
@@ -46,13 +47,31 @@ struct MemberPackageJson {
 
 impl NpmReader {
     fn read_root(monorepo_root: &Path) -> Option<RootPackageJson> {
-        let body = std::fs::read_to_string(monorepo_root.join("package.json")).ok()?;
-        serde_json::from_str(&body).ok()
+        let body = read_optional_file(&monorepo_root.join("package.json"), "npm-workspace")?;
+        match serde_json::from_str::<RootPackageJson>(&body) {
+            Ok(parsed) => Some(parsed),
+            Err(e) => {
+                warn!(
+                    "project reader 'npm-workspace': could not parse {}: {e}",
+                    monorepo_root.join("package.json").display()
+                );
+                None
+            }
+        }
     }
 
     fn read_member(path: &Path) -> Option<MemberPackageJson> {
-        let body = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&body).ok()
+        let body = read_optional_file(path, "npm-workspace")?;
+        match serde_json::from_str::<MemberPackageJson>(&body) {
+            Ok(parsed) => Some(parsed),
+            Err(e) => {
+                warn!(
+                    "project reader 'npm-workspace': could not parse {}: {e}",
+                    path.display()
+                );
+                None
+            }
+        }
     }
 
     fn workspace_globs(field: &WorkspacesField) -> &[String] {
@@ -63,20 +82,45 @@ impl NpmReader {
         }
     }
 
+    /// Expand workspace globs, rejecting unsafe patterns (absolute or
+    /// `..`) and confirming every match canonicalizes inside the
+    /// monorepo. (F-14)
     fn expand_globs(monorepo_root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {
+        let canonical_root = monorepo_root
+            .canonicalize()
+            .unwrap_or_else(|_| monorepo_root.to_path_buf());
         let mut out = Vec::new();
         for pat in patterns {
             if pat.starts_with('!') {
                 continue;
             }
+            if !is_safe_glob_pattern(pat) {
+                warn!(
+                    "project reader 'npm-workspace': rejecting unsafe workspace glob {pat:?}"
+                );
+                continue;
+            }
             let abs = monorepo_root.join(pat);
             for entry in glob::glob(abs.to_string_lossy().as_ref())? {
-                if let Ok(p) = entry
-                    && p.is_dir()
-                    && p.join("package.json").is_file()
-                {
-                    out.push(p);
+                let p = match entry {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("project reader 'npm-workspace': skipping unreadable workspace member: {e}");
+                        continue;
+                    }
+                };
+                if !p.is_dir() || !p.join("package.json").is_file() {
+                    continue;
                 }
+                let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
+                if !canonical.starts_with(&canonical_root) {
+                    warn!(
+                        "project reader 'npm-workspace': rejecting workspace member {} outside monorepo root",
+                        canonical.display()
+                    );
+                    continue;
+                }
+                out.push(p);
             }
         }
         out.sort();
@@ -127,26 +171,64 @@ impl MonorepoConfigReader for NpmReader {
                 continue;
             };
             let from = EdgeEndpoint::Path(member);
-            for deps in [&pkg.dependencies, &pkg.dev_dependencies, &pkg.peer_dependencies] {
+            for deps in [
+                &pkg.dependencies,
+                &pkg.dev_dependencies,
+                &pkg.peer_dependencies,
+            ] {
                 for name in deps.keys() {
-                    if view
-                        .resolve(&EdgeEndpoint::ForeignName {
-                            source: ProjectSource::NpmWorkspace,
-                            name: name.clone(),
-                        })
-                        .is_some()
-                    {
+                    let to = EdgeEndpoint::ForeignName {
+                        source: ProjectSource::NpmWorkspace,
+                        name: name.clone(),
+                    };
+                    if view.resolve(&to).is_some() {
                         out.push(ContributedEdge {
                             from: from.clone(),
-                            to: EdgeEndpoint::ForeignName {
-                                source: ProjectSource::NpmWorkspace,
-                                name: name.clone(),
-                            },
+                            to,
                         });
                     }
                 }
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_root_handles_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(NpmReader::read_root(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn workspace_globs_supports_array_and_object_forms() {
+        let arr = WorkspacesField::Array(vec!["packages/*".into()]);
+        assert_eq!(NpmReader::workspace_globs(&arr), &["packages/*"]);
+        let obj = WorkspacesField::Object {
+            packages: vec!["apps/*".into()],
+        };
+        assert_eq!(NpmReader::workspace_globs(&obj), &["apps/*"]);
+        let none = WorkspacesField::None;
+        assert!(NpmReader::workspace_globs(&none).is_empty());
+    }
+
+    #[test]
+    fn expand_globs_rejects_absolute_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = vec!["/etc/*".to_string()];
+        let result = NpmReader::expand_globs(tmp.path(), &bad).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn expand_globs_rejects_parent_dir_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = vec!["../../etc/*".to_string()];
+        let result = NpmReader::expand_globs(tmp.path(), &bad).unwrap();
+        assert!(result.is_empty());
     }
 }

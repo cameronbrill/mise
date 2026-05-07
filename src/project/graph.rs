@@ -19,8 +19,8 @@ use super::{Project, ProjectId, ProjectSource};
 #[derive(Debug, Clone, Default)]
 pub struct ProjectGraph {
     pub graph: DiGraph<Project, ()>,
-    pub by_id: HashMap<ProjectId, NodeIndex>,
-    pub name_index: HashMap<(ProjectSource, String), ProjectId>,
+    pub(crate) by_id: HashMap<ProjectId, NodeIndex>,
+    pub(crate) name_index: HashMap<(ProjectSource, String), ProjectId>,
     pub monorepo_root: PathBuf,
 }
 
@@ -43,11 +43,7 @@ impl ProjectGraph {
     /// are merged into the existing node.
     pub fn upsert_project(&mut self, project: Project) -> NodeIndex {
         if let Some(&idx) = self.by_id.get(&project.id) {
-            for (src, name) in &project.foreign_names {
-                self.name_index
-                    .entry((src.clone(), name.clone()))
-                    .or_insert_with(|| project.id.clone());
-            }
+            self.merge_foreign_names(&project.foreign_names, &project.id);
             let existing = &mut self.graph[idx];
             for (src, name) in project.foreign_names {
                 existing.foreign_names.entry(src).or_insert(name);
@@ -63,20 +59,43 @@ impl ProjectGraph {
             return idx;
         }
         let id = project.id.clone();
-        for (src, name) in &project.foreign_names {
-            self.name_index
-                .entry((src.clone(), name.clone()))
-                .or_insert_with(|| id.clone());
-        }
+        self.merge_foreign_names(&project.foreign_names, &id);
         let idx = self.graph.add_node(project);
         self.by_id.insert(id, idx);
         idx
     }
 
+    /// Insert each `(source, name) -> id` mapping into the name_index,
+    /// warning if a different id was previously registered for the same
+    /// key. (F-4) Without this, two projects coincidentally sharing a
+    /// foreign-format name silently route every cross-reference through
+    /// the first-inserted id.
+    fn merge_foreign_names(
+        &mut self,
+        names: &std::collections::BTreeMap<ProjectSource, String>,
+        id: &ProjectId,
+    ) {
+        for (src, name) in names {
+            let key = (src.clone(), name.clone());
+            match self.name_index.get(&key) {
+                Some(existing) if existing != id => {
+                    warn!(
+                        "project name collision in {src} namespace: '{name}' \
+                         claimed by both {existing} and {id} — keeping {existing}"
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    self.name_index.insert(key, id.clone());
+                }
+            }
+        }
+    }
+
     /// Adds an edge `from -> to` (meaning "from depends on to"). Both ids
     /// must already be present in the graph; missing ids are a soft error
     /// (the edge is dropped) so a partial graph can still render.
-    pub fn add_edge(&mut self, from: &ProjectId, to: &ProjectId) {
+    pub fn add_edge(&mut self, from: &str, to: &str) {
         let (Some(&from_idx), Some(&to_idx)) = (self.by_id.get(from), self.by_id.get(to)) else {
             return;
         };
@@ -93,7 +112,7 @@ impl ProjectGraph {
         self.graph.node_weights()
     }
 
-    pub fn project(&self, id: &ProjectId) -> Option<&Project> {
+    pub fn project(&self, id: &str) -> Option<&Project> {
         self.by_id.get(id).map(|&idx| &self.graph[idx])
     }
 
@@ -234,8 +253,8 @@ mod tests {
         g.upsert_project(proj("//b", ProjectSource::Mise));
         g.upsert_project(proj("//c", ProjectSource::Mise));
         // a depends on b; c depends on a → modifying b should affect a, b, c
-        g.add_edge(&"//a".into(), &"//b".into());
-        g.add_edge(&"//c".into(), &"//a".into());
+        g.add_edge("//a", "//b");
+        g.add_edge("//c", "//a");
         let affected = g.transitive_dependents(&["//b".into()]);
         let expected: BTreeSet<String> =
             ["//a".into(), "//b".into(), "//c".into()].into_iter().collect();
@@ -247,8 +266,8 @@ mod tests {
         let mut g = ProjectGraph::new(PathBuf::from("/tmp"));
         g.upsert_project(proj("//a", ProjectSource::Mise));
         g.upsert_project(proj("//b", ProjectSource::Mise));
-        g.add_edge(&"//a".into(), &"//b".into());
-        g.add_edge(&"//b".into(), &"//a".into());
+        g.add_edge("//a", "//b");
+        g.add_edge("//b", "//a");
         assert!(g.has_cycle());
     }
 

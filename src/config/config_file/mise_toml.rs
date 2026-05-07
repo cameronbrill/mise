@@ -129,6 +129,30 @@ pub struct MiseToml {
     /// Configuration for monorepo task discovery
     #[serde(default)]
     monorepo: Option<MonorepoConfig>,
+    /// Project metadata for monorepo project graph (experimental, gated by
+    /// `Settings::ensure_experimental("project-graph")`). Consumed by
+    /// `mise affected` and the project-graph reader; safely ignored by
+    /// other code paths.
+    #[serde(default)]
+    project: Option<MiseProjectSection>,
+}
+
+/// `[project]` table contents. Mirrors `MiseProjectSection` parsed by
+/// the project-graph mise reader; lives here so serde recognizes the
+/// field and doesn't emit unknown-field warnings during normal config
+/// loading.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct MiseProjectSection {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub depends: Vec<String>,
+    #[serde(default)]
+    pub implicit_dependencies: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1015,6 +1039,7 @@ impl Clone for MiseToml {
             vars: self.vars.clone(),
             experimental_monorepo_root: self.experimental_monorepo_root,
             monorepo: self.monorepo.clone(),
+            project: self.project.clone(),
         }
     }
 }
