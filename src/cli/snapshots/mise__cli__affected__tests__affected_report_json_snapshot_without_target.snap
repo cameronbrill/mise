@@ -1,0 +1,14 @@
+---
+source: src/cli/affected.rs
+expression: "&report"
+---
+{
+  "schema": "mise-affected-experimental",
+  "version": 1,
+  "base": "main",
+  "head": "HEAD",
+  "projects": [
+    "//libs/shared"
+  ],
+  "target_tasks": null
+}

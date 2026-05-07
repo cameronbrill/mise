@@ -1,0 +1,18 @@
+---
+source: src/cli/affected.rs
+expression: "&report"
+---
+{
+  "schema": "mise-affected-experimental",
+  "version": 1,
+  "base": "main",
+  "head": "HEAD",
+  "projects": [
+    "//apps/api",
+    "//apps/web"
+  ],
+  "target_tasks": [
+    "//apps/api:build",
+    "//apps/web:build"
+  ]
+}
