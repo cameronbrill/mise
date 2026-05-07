@@ -423,6 +423,16 @@ impl Config {
         find_monorepo_root(&self.config_files)
     }
 
+    /// Build the project graph for the current monorepo. Returns
+    /// `Ok(None)` if there is no monorepo root configured. Gated by
+    /// `Settings::ensure_experimental("project-graph")`.
+    pub fn project_graph(&self) -> Result<Option<crate::project::ProjectGraph>> {
+        let Some(root) = self.monorepo_root() else {
+            return Ok(None);
+        };
+        Ok(Some(crate::project::build_default_graph(&root)?))
+    }
+
     pub async fn tasks(&self) -> Result<Arc<BTreeMap<String, Task>>> {
         self.tasks_with_context(None).await
     }

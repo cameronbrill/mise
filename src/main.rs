@@ -72,6 +72,7 @@ mod path;
 mod path_env;
 mod platform;
 mod plugins;
+mod project;
 mod rand;
 mod redactions;
 mod registry;
