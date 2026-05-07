@@ -9,11 +9,15 @@ pub mod pnpm_reader;
 pub mod turbo_reader;
 
 /// Walk a monorepo root collecting directories that contain at least one of
-/// `markers`. Used by every reader to find its files. Respects `.gitignore`,
-/// skips hidden directories, and bounds depth to a sensible max.
+/// `markers`. Used by every reader to find its files. Respects `.gitignore`
+/// and bounds depth to a sensible max.
+///
+/// `.hidden(false)` so dot-prefixed marker files like `.mise.toml` are
+/// visible. The previous default (`.hidden(true)`) silently dropped every
+/// project that used the dotfile form.
 ///
 /// Walk errors are logged at `warn!` and skipped instead of being silently
-/// swallowed (F-8 from review).
+/// swallowed.
 pub(crate) fn walk_for_markers(
     monorepo_root: &Path,
     markers: &[&str],
@@ -22,7 +26,7 @@ pub(crate) fn walk_for_markers(
     let mut hits = Vec::new();
     let walker = ignore::WalkBuilder::new(monorepo_root)
         .max_depth(Some(max_depth))
-        .hidden(true)
+        .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
@@ -77,7 +81,7 @@ pub(crate) fn read_optional_file(path: &Path, reader_id: &str) -> Option<String>
 /// Reject globs that escape the monorepo root: absolute paths and
 /// patterns containing `..` components. Without this, a malicious
 /// `pnpm-workspace.yaml` or root `package.json` can enumerate paths
-/// outside the monorepo. (F-14)
+/// outside the monorepo.
 pub(crate) fn is_safe_glob_pattern(pat: &str) -> bool {
     if pat.is_empty() {
         return false;
@@ -88,4 +92,61 @@ pub(crate) fn is_safe_glob_pattern(pat: &str) -> bool {
     }
     !p.components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn walk_for_markers_finds_dotfile_mise_toml() {
+        // Regression: previous version used `.hidden(true)` which made the
+        // walker skip every `.mise.toml` file even though the marker list
+        // included it. Verifies the dotfile form is now reachable.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("apps/web");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".mise.toml"), "[project]\nname = \"web\"").unwrap();
+        let hits = walk_for_markers(tmp.path(), &["mise.toml", ".mise.toml"], 8).unwrap();
+        assert!(
+            hits.contains(&dir),
+            "expected walk to find apps/web (with .mise.toml); got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn walk_for_markers_finds_plain_mise_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("libs/shared");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mise.toml"), "[project]\nname = \"shared\"").unwrap();
+        let hits = walk_for_markers(tmp.path(), &["mise.toml", ".mise.toml"], 8).unwrap();
+        assert!(hits.contains(&dir));
+    }
+
+    #[test]
+    fn walk_for_markers_respects_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("ignored")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(tmp.path().join("ignored/mise.toml"), "[project]").unwrap();
+        std::fs::create_dir_all(tmp.path().join("kept")).unwrap();
+        std::fs::write(tmp.path().join("kept/mise.toml"), "[project]").unwrap();
+        let hits = walk_for_markers(tmp.path(), &["mise.toml"], 8).unwrap();
+        assert!(hits.iter().any(|p| p.ends_with("kept")));
+        assert!(
+            !hits.iter().any(|p| p.ends_with("ignored")),
+            "gitignored dir should not be walked: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn is_safe_glob_pattern_rejects_unsafe() {
+        assert!(!is_safe_glob_pattern(""));
+        assert!(!is_safe_glob_pattern("/etc/*"));
+        assert!(!is_safe_glob_pattern("../../etc"));
+        assert!(!is_safe_glob_pattern("apps/../../etc"));
+        assert!(is_safe_glob_pattern("apps/*"));
+        assert!(is_safe_glob_pattern("packages/**"));
+    }
 }
