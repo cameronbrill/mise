@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use eyre::Result;
 use serde::Deserialize;
 
-use super::{is_safe_glob_pattern, read_optional_file};
+use super::{expand_workspace_globs, filter_members_by_config_roots, read_optional_file};
 use crate::project::ProjectSource;
 use crate::project::reader::{
     ContributedEdge, ContributedProject, EdgeEndpoint, MonorepoConfigReader, ReaderContext,
@@ -83,51 +83,6 @@ impl NpmReader {
         }
     }
 
-    /// Expand workspace globs, rejecting unsafe patterns (absolute or
-    /// `..`) and confirming every match canonicalizes inside the
-    /// monorepo to defend against malicious workspace declarations.
-    fn expand_globs(monorepo_root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {
-        let canonical_root = monorepo_root
-            .canonicalize()
-            .unwrap_or_else(|_| monorepo_root.to_path_buf());
-        let mut out = Vec::new();
-        for pat in patterns {
-            if pat.starts_with('!') {
-                continue;
-            }
-            if !is_safe_glob_pattern(pat) {
-                warn!(
-                    "project reader 'npm-workspace': rejecting unsafe workspace glob {pat:?}"
-                );
-                continue;
-            }
-            let abs = monorepo_root.join(pat);
-            for entry in glob::glob(abs.to_string_lossy().as_ref())? {
-                let p = match entry {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!("project reader 'npm-workspace': skipping unreadable workspace member: {e}");
-                        continue;
-                    }
-                };
-                if !p.is_dir() || !p.join("package.json").is_file() {
-                    continue;
-                }
-                let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
-                if !canonical.starts_with(&canonical_root) {
-                    warn!(
-                        "project reader 'npm-workspace': rejecting workspace member {} outside monorepo root",
-                        canonical.display()
-                    );
-                    continue;
-                }
-                out.push(p);
-            }
-        }
-        out.sort();
-        out.dedup();
-        Ok(out)
-    }
 }
 
 impl MonorepoConfigReader for NpmReader {
@@ -140,8 +95,11 @@ impl MonorepoConfigReader for NpmReader {
         let Some(root_pkg) = Self::read_root(monorepo_root) else {
             return Ok(Vec::new());
         };
-        let members =
-            Self::expand_globs(monorepo_root, Self::workspace_globs(&root_pkg.workspaces))?;
+        let members = expand_workspace_globs(
+            monorepo_root,
+            Self::workspace_globs(&root_pkg.workspaces),
+            "npm-workspace",
+        )?;
         let members = filter_members_by_config_roots(members, ctx);
         let mut out = Vec::new();
         for member in members {
@@ -167,8 +125,11 @@ impl MonorepoConfigReader for NpmReader {
         let Some(root_pkg) = Self::read_root(monorepo_root) else {
             return Ok(Vec::new());
         };
-        let members =
-            Self::expand_globs(monorepo_root, Self::workspace_globs(&root_pkg.workspaces))?;
+        let members = expand_workspace_globs(
+            monorepo_root,
+            Self::workspace_globs(&root_pkg.workspaces),
+            "npm-workspace",
+        )?;
         let members = filter_members_by_config_roots(members, ctx);
         let mut out = Vec::new();
         for member in members {
@@ -199,25 +160,6 @@ impl MonorepoConfigReader for NpmReader {
     }
 }
 
-/// Drop workspace members that don't sit under any of `ctx.config_roots`.
-/// When `config_roots` is unset, all members are kept (the deprecated
-/// implicit-discovery default).
-fn filter_members_by_config_roots(
-    members: Vec<PathBuf>,
-    ctx: &ReaderContext,
-) -> Vec<PathBuf> {
-    let Some(roots) = ctx.config_roots.as_ref() else {
-        return members;
-    };
-    if roots.is_empty() {
-        return members;
-    }
-    members
-        .into_iter()
-        .filter(|m| roots.iter().any(|r| m.starts_with(r) || m == r))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,21 +180,5 @@ mod tests {
         assert_eq!(NpmReader::workspace_globs(&obj), &["apps/*"]);
         let none = WorkspacesField::None;
         assert!(NpmReader::workspace_globs(&none).is_empty());
-    }
-
-    #[test]
-    fn expand_globs_rejects_absolute_patterns() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bad = vec!["/etc/*".to_string()];
-        let result = NpmReader::expand_globs(tmp.path(), &bad).unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn expand_globs_rejects_parent_dir_patterns() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bad = vec!["../../etc/*".to_string()];
-        let result = NpmReader::expand_globs(tmp.path(), &bad).unwrap();
-        assert!(result.is_empty());
     }
 }

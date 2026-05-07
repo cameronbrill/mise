@@ -57,7 +57,7 @@ impl MiseAquaRegistry {
                 });
 
         if let Some(registry_url) = registry_url {
-            if repo.exists() {
+            if repo.local_clone_exists() {
                 fetch_latest_repo(&repo)?;
             } else {
                 info!("cloning aqua registry from {registry_url} to {path:?}");
@@ -77,7 +77,7 @@ impl MiseAquaRegistry {
         Ok(Self {
             inner,
             path,
-            repo_exists: repo.exists(),
+            repo_exists: repo.local_clone_exists(),
         })
     }
 

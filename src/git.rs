@@ -58,6 +58,14 @@ impl Git {
         self.dir.join(".git").is_dir()
     }
 
+    /// Return true when `<dir>/.git` is a directory (the local-clone
+    /// shape used by `clone()` callers). This is intentionally narrower
+    /// than `is_repo()` — callers checking "did we already clone here?"
+    /// want false for worktrees / nested-below-toplevel layouts.
+    pub fn local_clone_exists(&self) -> bool {
+        self.dir.join(".git").is_dir()
+    }
+
     pub fn update(&self, gitref: Option<String>) -> Result<(String, String)> {
         let gitref = gitref.map_or_else(|| self.current_branch(), Ok)?;
         self.update_ref(gitref, false)

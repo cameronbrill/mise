@@ -276,11 +276,18 @@ mod tests {
         )
         .unwrap();
 
-        // Root turbo.json with a pipeline entry that references a
-        // workspace package by its `package.json` name. The turbo
-        // reader resolves this via the npm-workspace name_index.
+        // Per-package `turbo.json` files. The turbo reader emits one
+        // edge per `<pkg>#<task>` reference, attributed to the package
+        // that owns the entry. This exercises the post-fan-out edge
+        // path: api.turbo.json declares `pipeline.build.dependsOn =
+        // ["@org/shared#build"]`, so api → shared.
         std::fs::write(
             root.join("turbo.json"),
+            r#"{"pipeline":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/api/turbo.json"),
             r#"{"pipeline":{"build":{"dependsOn":["@org/shared#build"]}}}"#,
         )
         .unwrap();
@@ -321,8 +328,21 @@ mod tests {
             "web should be a dependent of shared via the npm dependency; got {affected_by_shared:?}"
         );
 
-        // Exact set check — fan-out bugs (extra edges) would fail this.
+        // Exact set check — fan-out bugs (extra edges to non-dependents)
+        // would fail this.
         assert_eq!(affected_by_shared, expected_ids);
+
+        // Edge-count check — locks in the exact graph shape so a bug
+        // that adds duplicate or spurious edges (e.g., a regression of
+        // turbo's fan-out behavior) trips this even if the reachability
+        // sets stay correct. Expected edges:
+        //   - //apps/web → //libs/shared (npm `dependencies`)
+        //   - //apps/api → //libs/shared (nx `implicitDependencies`)
+        //   - //apps/api → //libs/shared (turbo `pipeline.build.dependsOn`)
+        // npm-deps and turbo both target shared from api/web; petgraph
+        // dedupes via update_edge so duplicates collapse to a single
+        // edge per (from, to) pair → 2 distinct edges.
+        assert_eq!(graph.graph.edge_count(), 2);
 
         // No incoming edges to api: changing api shouldn't affect anything else.
         let affected_by_api = graph.transitive_dependents(&["//apps/api".into()]);

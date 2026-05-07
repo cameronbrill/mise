@@ -451,22 +451,24 @@ impl Config {
     /// Expand `[monorepo].config_roots` into absolute paths so the
     /// project-graph readers can restrict their walks. Returns `None`
     /// when no `config_roots` are declared (the deprecated implicit-
-    /// discovery path). Errors during glob expansion are warn-logged
-    /// and the default (full walk) is returned.
+    /// discovery path).
+    ///
+    /// Unlike the task-system's `expand_config_roots` (which filters
+    /// to dirs containing a mise config file via `has_mise_config`),
+    /// this expansion accepts any directory that matches the patterns.
+    /// The project-graph readers recognize foreign markers
+    /// (`project.json`, `package.json`, `pnpm-workspace.yaml`,
+    /// `turbo.json`), so a pure-nx or pure-npm monorepo with
+    /// `config_roots = ["apps/*"]` and no mise.toml in subdirs still
+    /// gets a populated graph.
     fn project_config_roots(&self, root: &Path) -> Option<Vec<PathBuf>> {
         let cf = find_monorepo_config(&self.config_files)?;
         let monorepo = cf.monorepo()?;
         if monorepo.config_roots.is_empty() {
             return None;
         }
-        match expand_config_roots(root, &monorepo.config_roots, None) {
-            Ok(paths) if !paths.is_empty() => Some(paths),
-            Ok(_) => None,
-            Err(e) => {
-                warn!("project-graph: failed to expand [monorepo].config_roots: {e}");
-                None
-            }
-        }
+        let paths = expand_config_roots_unfiltered(root, &monorepo.config_roots);
+        if paths.is_empty() { None } else { Some(paths) }
     }
 
     pub async fn tasks(&self) -> Result<Arc<BTreeMap<String, Task>>> {
@@ -2106,6 +2108,65 @@ fn has_mise_config(dir: &Path) -> bool {
         .any(|f| dir.join(f).exists())
         || dir.join(".mise/tasks").is_dir()
         || dir.join("mise-tasks").is_dir()
+}
+
+/// Expand `[monorepo].config_roots` patterns without the
+/// `has_mise_config` filter. Used by the project-graph readers, which
+/// recognize foreign markers (`project.json`, `package.json`,
+/// `pnpm-workspace.yaml`, `turbo.json`) in addition to mise files.
+/// Rejects unsafe patterns (absolute paths, `..` traversal,
+/// recursive `**` globs) and rejects matches that escape `root`.
+fn expand_config_roots_unfiltered(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for pattern in patterns {
+        if pattern.starts_with('/') || pattern.starts_with("..") || pattern.contains("/../") {
+            warn!(
+                "[monorepo] config_roots: '{pattern}' must be a relative path within the monorepo"
+            );
+            continue;
+        }
+        if pattern.contains("**") {
+            warn!(
+                "[monorepo] config_roots: recursive glob '**' not supported in '{pattern}', use single-level '*' instead"
+            );
+            continue;
+        }
+        if pattern.contains('*') {
+            let full_pattern = root.join(pattern);
+            match glob::glob(&full_pattern.to_string_lossy()) {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok(path) => {
+                                if path.strip_prefix(root).is_err() {
+                                    warn!(
+                                        "[monorepo] config_roots: glob matched path outside monorepo root: {}",
+                                        path.display()
+                                    );
+                                    continue;
+                                }
+                                if path.is_dir() {
+                                    out.push(path);
+                                }
+                            }
+                            Err(e) => warn!("[monorepo] config_roots glob error: {e}"),
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("[monorepo] config_roots: invalid glob pattern '{pattern}': {e}");
+                }
+            }
+        } else {
+            let direct_path = root.join(pattern);
+            if direct_path.is_dir() {
+                out.push(direct_path);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn discover_monorepo_subdirs(

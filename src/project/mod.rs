@@ -10,16 +10,7 @@ pub mod wire;
 pub use graph::ProjectGraph;
 pub use reader::MonorepoConfigReader;
 
-// Internal-only re-exports. ContributedEdge/ContributedProject and the
-// wire format types are stable surface for downstream PRs (project-graph
-// plugin protocol, `mise graph`) but no consumer references them through
-// `crate::project::*` yet, so re-exporting `pub use` would generate
-// unused-import warnings.
 pub(crate) use builder::{build_project_graph, default_readers};
-#[allow(unused_imports)]
-pub(crate) use reader::{ContributedEdge, ContributedProject};
-#[allow(unused_imports)]
-pub(crate) use wire::{WIRE_SCHEMA_EXPERIMENTAL, WireProjectGraph};
 
 /// Canonical identifier for a project.
 ///
@@ -32,7 +23,8 @@ pub type ProjectId = String;
 ///
 /// Cross-format edge resolution uses `(ProjectSource, name)` keys via the
 /// `name_index` on `ProjectGraph`, since most foreign formats reference
-/// projects by name rather than path.
+/// projects by name rather than path. `#[non_exhaustive]` keeps room
+/// for future plugin-host variants without breaking matches.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -42,7 +34,6 @@ pub enum ProjectSource {
     Turbo,
     PnpmWorkspace,
     NpmWorkspace,
-    Plugin(String),
 }
 
 impl std::fmt::Display for ProjectSource {
@@ -53,7 +44,6 @@ impl std::fmt::Display for ProjectSource {
             ProjectSource::Turbo => f.write_str("turbo"),
             ProjectSource::PnpmWorkspace => f.write_str("pnpm-workspace"),
             ProjectSource::NpmWorkspace => f.write_str("npm-workspace"),
-            ProjectSource::Plugin(name) => write!(f, "plugin:{name}"),
         }
     }
 }
@@ -137,9 +127,6 @@ mod tests {
     fn project_source_display() {
         assert_eq!(ProjectSource::Mise.to_string(), "mise");
         assert_eq!(ProjectSource::Nx.to_string(), "nx");
-        assert_eq!(
-            ProjectSource::Plugin("vfox".into()).to_string(),
-            "plugin:vfox"
-        );
+        assert_eq!(ProjectSource::PnpmWorkspace.to_string(), "pnpm-workspace");
     }
 }
