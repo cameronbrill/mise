@@ -148,7 +148,7 @@ impl SPMBackend {
         revision: &str,
     ) -> Result<PathBuf, eyre::Error> {
         let repo = Git::new(tv.cache_path().join("repo"));
-        if !repo.exists() {
+        if !repo.local_clone_exists() {
             debug!(
                 "Cloning swift package repo {} to {}",
                 package_repo.url.as_str(),

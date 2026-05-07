@@ -5,7 +5,7 @@ use std::sync::Arc;
 use eyre::{Result, WrapErr, bail, eyre};
 use serde::Serialize;
 
-use crate::config::{Config, Settings};
+use crate::config::Config;
 use crate::git::Git;
 use crate::project::{ProjectGraph, ProjectId};
 use crate::task::TaskLoadContext;
@@ -96,8 +96,11 @@ const AFTER_LONG_HELP: &str = color_print::cstr!(
 
 impl Affected {
     pub async fn run(self) -> Result<()> {
-        Settings::get().ensure_experimental("project-graph")?;
-
+        // `Config::project_graph()` carries the experimental gate; the
+        // direct call here would have double-gated. When experimental
+        // is off, `project_graph()` returns `Ok(None)` (because
+        // `find_monorepo_config` already filters on the flag) and the
+        // `bail!` below points at the right setting.
         validate_ref(self.base.as_deref(), "--base")?;
         validate_ref(self.head.as_deref(), "--head")?;
 
@@ -400,5 +403,56 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // No git init; should return "main" without erroring.
         assert_eq!(default_base(tmp.path()).unwrap(), "main");
+    }
+
+    fn graph_with_root(root: PathBuf) -> Arc<ProjectGraph> {
+        Arc::new(ProjectGraph::new(root))
+    }
+
+    #[test]
+    fn resolve_user_files_strips_monorepo_root_for_relative_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let graph = graph_with_root(root.clone());
+        // Create a file inside the monorepo so canonicalize succeeds.
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        let files = vec![root.join("a.txt").to_string_lossy().into_owned()];
+        let resolved = resolve_user_files(&graph, &files).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0], PathBuf::from("a.txt"));
+    }
+
+    #[test]
+    fn resolve_user_files_warns_and_drops_outside_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let graph = graph_with_root(root);
+        std::fs::write(other.path().join("escape.txt"), "x").unwrap();
+        let files = vec![
+            other
+                .path()
+                .join("escape.txt")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let resolved = resolve_user_files(&graph, &files).unwrap();
+        // Outside-root paths are warn-logged and dropped.
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn resolve_user_files_handles_canonicalized_root_with_symlinked_tmp() {
+        // Even when the user provides a path through a symlinked tmp
+        // dir, canonicalizing both sides should produce a stable
+        // strip_prefix result.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let graph = graph_with_root(root.clone());
+        std::fs::create_dir_all(root.join("apps/web")).unwrap();
+        std::fs::write(root.join("apps/web/main.ts"), "x").unwrap();
+        let files = vec![root.join("apps/web/main.ts").to_string_lossy().into_owned()];
+        let resolved = resolve_user_files(&graph, &files).unwrap();
+        assert_eq!(resolved, vec![PathBuf::from("apps/web/main.ts")]);
     }
 }

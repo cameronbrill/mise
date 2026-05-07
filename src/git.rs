@@ -334,7 +334,7 @@ impl Git {
 
     pub fn get_remote_url(&self) -> Option<String> {
         let dir = &self.dir;
-        if !self.exists() {
+        if !self.local_clone_exists() {
             return None;
         }
         if let Ok(repo) = self.repo()
@@ -371,10 +371,6 @@ impl Git {
             .next()
             .and_then(|line| line.split_whitespace().next())
             .map(|sha| sha.to_string()))
-    }
-
-    pub fn exists(&self) -> bool {
-        self.dir.join(".git").is_dir()
     }
 
     pub fn get_root() -> eyre::Result<PathBuf> {
