@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Verifies `mise affected` returns affected projects + transitive dependents.
+set -e
 export MISE_EXPERIMENTAL=1
 
-git init -q -b main .
+# `git -c init.defaultBranch=main init` works on every git ≥ 2.0; `-b` requires 2.28.
+git -c init.defaultBranch=main init -q .
 git config user.email test@test.com
 git config user.name "Test"
 
@@ -45,22 +47,31 @@ echo "// changed" >libs/shared/index.ts
 git add -A
 git commit -qm "shared change"
 
+# `set -e` ensures any failing assertion aborts the script — using a brace
+# group instead of a subshell so `exit 1` actually exits the test (the
+# previous `(... && exit 1)` form only exited the subshell).
+fail() { echo "FAIL: $1" >&2; exit 1; }
+
 echo "=== mise affected --base main --head HEAD ==="
 out=$(mise affected --base main --head HEAD)
 echo "$out"
-echo "$out" | grep -q "//libs/shared" || (echo "FAIL: shared not in output" && exit 1)
-echo "$out" | grep -q "//apps/web" || (echo "FAIL: web not in output (transitive via npm dep)" && exit 1)
+echo "$out" | grep -qx "//libs/shared" || fail "shared not in output"
+echo "$out" | grep -qx "//apps/web" || fail "web not in output (transitive via npm dep)"
 
 echo "=== mise affected --base main --head HEAD --target build ==="
 out=$(mise affected --base main --head HEAD --target build)
 echo "$out"
-echo "$out" | grep -q "//apps/web" || (echo "FAIL: web (has build target) not in output" && exit 1)
-echo "$out" | grep -q "//libs/shared" && (echo "FAIL: shared has no build target, should not appear" && exit 1)
+echo "$out" | grep -qx "//apps/web" || fail "web (has build target) not in output"
+if echo "$out" | grep -qx "//libs/shared"; then
+  fail "shared has no build target, should not appear"
+fi
 
 echo "=== mise affected --base main --head HEAD --exclude //apps/web ==="
 out=$(mise affected --base main --head HEAD --exclude //apps/web)
 echo "$out"
-echo "$out" | grep -q "//apps/web" && (echo "FAIL: web should be excluded" && exit 1)
-echo "$out" | grep -q "//libs/shared" || (echo "FAIL: shared not in output" && exit 1)
+if echo "$out" | grep -qx "//apps/web"; then
+  fail "web should be excluded"
+fi
+echo "$out" | grep -qx "//libs/shared" || fail "shared not in output"
 
 echo "=== Affected basic test passed ==="

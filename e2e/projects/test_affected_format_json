@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Verifies `mise affected --format json` produces parseable JSON with the expected schema.
+# Verifies `mise affected --format json` produces parseable JSON with the
+# expected schema, including absent-project and ordering invariants.
+set -e
 export MISE_EXPERIMENTAL=1
 
-git init -q -b main .
+git -c init.defaultBranch=main init -q .
 git config user.email test@test.com
 git config user.name "Test"
 
@@ -33,9 +35,17 @@ git commit -qm "a change"
 
 out=$(mise affected --base main --head HEAD --format json)
 echo "$out"
+echo "$out" | jq -e '.schema == "mise-affected-experimental"' >/dev/null
+echo "$out" | jq -e '.version == 1' >/dev/null
 echo "$out" | jq -e '.base == "main"' >/dev/null
 echo "$out" | jq -e '.head == "HEAD"' >/dev/null
 echo "$out" | jq -e '.projects | type == "array"' >/dev/null
-echo "$out" | jq -e '.projects | index("//a")' >/dev/null
+echo "$out" | jq -e '.projects | index("//a") != null' >/dev/null
+# `b` was unchanged — must be absent.
+echo "$out" | jq -e '.projects | index("//b") == null' >/dev/null
+# Ordering must be deterministic so consumers can pin against snapshots.
+echo "$out" | jq -e '.projects == (.projects | sort)' >/dev/null
+# No --target was passed, so target_tasks is null.
+echo "$out" | jq -e '.target_tasks == null' >/dev/null
 
 echo "=== Affected JSON format test passed ==="

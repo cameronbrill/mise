@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 
@@ -55,7 +56,9 @@ impl Git {
     }
 
     pub fn is_repo(&self) -> bool {
-        self.dir.join(".git").is_dir()
+        // `.git` is a directory in normal repos but a regular file in
+        // worktrees and submodules. `exists()` covers both. (F-19)
+        self.dir.join(".git").exists()
     }
 
     /// Return true when `<dir>/.git` is a directory (the local-clone
@@ -364,32 +367,54 @@ impl Git {
             .into())
     }
 
+    /// Verify a git ref exists, returning its resolved sha.
+    pub fn rev_parse_verify(&self, refname: &str) -> Result<String> {
+        // `--end-of-options` so an attacker-controlled ref starting with
+        // `--` is treated as a positional arg rather than a flag. (F-1)
+        Ok(
+            git_cmd_read!(&self.dir, "rev-parse", "--verify", "--end-of-options", refname)?
+                .trim()
+                .into(),
+        )
+    }
+
     /// `git merge-base <a> <b>` — the common ancestor commit. Used by
     /// `mise affected` to compute the base ref when the user passes
     /// branch names rather than commits.
     pub fn merge_base(&self, a: &str, b: &str) -> Result<String> {
-        Ok(git_cmd_read!(&self.dir, "merge-base", a, b)?
-            .trim()
-            .to_string())
+        Ok(
+            git_cmd_read!(&self.dir, "merge-base", "--end-of-options", a, b)?
+                .trim()
+                .into(),
+        )
     }
 
     /// Files changed between `base` and `head` according to git. Output
-    /// is a deduplicated, sorted list of repo-relative paths. Includes
-    /// committed changes plus, when `include_uncommitted` is true,
-    /// uncommitted-and-untracked working-tree changes.
+    /// paths are relative to `self.dir` (the monorepo root) — the
+    /// `--relative` flag handles the case where the repo's `.git`
+    /// directory is above `self.dir` (nested-monorepo layouts). (F-2)
+    /// Includes committed changes plus, when `include_uncommitted` is
+    /// true, uncommitted-and-untracked working-tree changes.
     pub fn changed_files(
         &self,
         base: &str,
         head: &str,
         include_uncommitted: bool,
     ) -> Result<Vec<PathBuf>> {
-        let mut paths: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+        let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
 
         // Three-dot diff: changes on `head` not in the merge-base of
         // `base..head`. Matches nx's `--base...--head` semantics.
         let range = format!("{base}...{head}");
-        let committed =
-            git_cmd_read!(&self.dir, "diff", "--name-only", "--no-renames", &range)?;
+        let committed = git_cmd_read!(
+            &self.dir,
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--relative",
+            "--end-of-options",
+            &range
+        )?;
         for line in committed.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
@@ -399,7 +424,13 @@ impl Git {
 
         if include_uncommitted {
             // Tracked but uncommitted changes in the working tree.
-            let working = git_cmd_read!(&self.dir, "diff", "--name-only", "--no-renames")?;
+            let working = git_cmd_read!(
+                &self.dir,
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "--relative"
+            )?;
             for line in working.lines() {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
@@ -412,7 +443,7 @@ impl Git {
                 &self.dir,
                 "ls-files",
                 "--others",
-                "--exclude-standard",
+                "--exclude-standard"
             )?;
             for line in untracked.lines() {
                 let trimmed = line.trim();
