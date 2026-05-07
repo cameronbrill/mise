@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Verifies `mise affected --format json` produces parseable JSON with the expected schema.
+export MISE_EXPERIMENTAL=1
+
+git init -q -b main .
+git config user.email test@test.com
+git config user.name "Test"
+
+cat <<'TOML' >mise.toml
+experimental_monorepo_root = true
+[monorepo]
+config_roots = ["a", "b"]
+TOML
+
+mkdir -p a b
+cat <<'TOML' >a/mise.toml
+[project]
+name = "a"
+sources = ["**"]
+TOML
+cat <<'TOML' >b/mise.toml
+[project]
+name = "b"
+sources = ["**"]
+TOML
+
+git add -A
+git commit -qm "initial"
+git checkout -qb feature
+echo "x" >a/foo.txt
+git add -A
+git commit -qm "a change"
+
+out=$(mise affected --base main --head HEAD --format json)
+echo "$out"
+echo "$out" | jq -e '.base == "main"' >/dev/null
+echo "$out" | jq -e '.head == "HEAD"' >/dev/null
+echo "$out" | jq -e '.projects | type == "array"' >/dev/null
+echo "$out" | jq -e '.projects | index("//a")' >/dev/null
+
+echo "=== Affected JSON format test passed ==="

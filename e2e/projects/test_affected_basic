@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Verifies `mise affected` returns affected projects + transitive dependents.
+export MISE_EXPERIMENTAL=1
+
+git init -q -b main .
+git config user.email test@test.com
+git config user.name "Test"
+
+cat <<'TOML' >mise.toml
+experimental_monorepo_root = true
+[monorepo]
+config_roots = ["apps/*", "libs/*"]
+TOML
+
+mkdir -p apps/web libs/shared
+
+cat <<'TOML' >apps/web/mise.toml
+[project]
+name = "web"
+sources = ["**/*.ts"]
+[tasks.build]
+run = 'echo "build web"'
+TOML
+cat <<'JSON' >apps/web/package.json
+{"name":"@org/web","dependencies":{"@org/shared":"*"}}
+JSON
+
+cat <<'TOML' >libs/shared/mise.toml
+[project]
+name = "shared"
+sources = ["**/*.ts"]
+TOML
+cat <<'JSON' >libs/shared/package.json
+{"name":"@org/shared"}
+JSON
+
+cat <<'JSON' >package.json
+{"name":"root","workspaces":["apps/*","libs/*"]}
+JSON
+
+git add -A
+git commit -qm "initial"
+git checkout -qb feature
+echo "// changed" >libs/shared/index.ts
+git add -A
+git commit -qm "shared change"
+
+echo "=== mise affected --base main --head HEAD ==="
+out=$(mise affected --base main --head HEAD)
+echo "$out"
+echo "$out" | grep -q "//libs/shared" || (echo "FAIL: shared not in output" && exit 1)
+echo "$out" | grep -q "//apps/web" || (echo "FAIL: web not in output (transitive via npm dep)" && exit 1)
+
+echo "=== mise affected --base main --head HEAD --target build ==="
+out=$(mise affected --base main --head HEAD --target build)
+echo "$out"
+echo "$out" | grep -q "//apps/web" || (echo "FAIL: web (has build target) not in output" && exit 1)
+echo "$out" | grep -q "//libs/shared" && (echo "FAIL: shared has no build target, should not appear" && exit 1)
+
+echo "=== mise affected --base main --head HEAD --exclude //apps/web ==="
+out=$(mise affected --base main --head HEAD --exclude //apps/web)
+echo "$out"
+echo "$out" | grep -q "//apps/web" && (echo "FAIL: web should be excluded" && exit 1)
+echo "$out" | grep -q "//libs/shared" || (echo "FAIL: shared not in output" && exit 1)
+
+echo "=== Affected basic test passed ==="

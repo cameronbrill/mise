@@ -10,6 +10,7 @@ use eyre::bail;
 use std::path::PathBuf;
 
 mod activate;
+mod affected;
 pub mod args;
 mod asdf;
 pub mod backends;
@@ -202,6 +203,7 @@ pub struct Cli {
 #[strum(serialize_all = "kebab-case")]
 pub enum Commands {
     Activate(activate::Activate),
+    Affected(affected::Affected),
     ToolAlias(Box<tool_alias::ToolAlias>),
     Asdf(asdf::Asdf),
     Backends(backends::Backends),
@@ -273,6 +275,7 @@ impl Commands {
     pub async fn run(self) -> Result<()> {
         match self {
             Self::Activate(cmd) => cmd.run(),
+            Self::Affected(cmd) => cmd.run().await,
             Self::ToolAlias(cmd) => cmd.run().await,
             Self::Asdf(cmd) => cmd.run().await,
             Self::Backends(cmd) => cmd.run().await,

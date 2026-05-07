@@ -363,6 +363,67 @@ impl Git {
             .trim()
             .into())
     }
+
+    /// `git merge-base <a> <b>` — the common ancestor commit. Used by
+    /// `mise affected` to compute the base ref when the user passes
+    /// branch names rather than commits.
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<String> {
+        Ok(git_cmd_read!(&self.dir, "merge-base", a, b)?
+            .trim()
+            .to_string())
+    }
+
+    /// Files changed between `base` and `head` according to git. Output
+    /// is a deduplicated, sorted list of repo-relative paths. Includes
+    /// committed changes plus, when `include_uncommitted` is true,
+    /// uncommitted-and-untracked working-tree changes.
+    pub fn changed_files(
+        &self,
+        base: &str,
+        head: &str,
+        include_uncommitted: bool,
+    ) -> Result<Vec<PathBuf>> {
+        let mut paths: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+
+        // Three-dot diff: changes on `head` not in the merge-base of
+        // `base..head`. Matches nx's `--base...--head` semantics.
+        let range = format!("{base}...{head}");
+        let committed =
+            git_cmd_read!(&self.dir, "diff", "--name-only", "--no-renames", &range)?;
+        for line in committed.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                paths.insert(PathBuf::from(trimmed));
+            }
+        }
+
+        if include_uncommitted {
+            // Tracked but uncommitted changes in the working tree.
+            let working = git_cmd_read!(&self.dir, "diff", "--name-only", "--no-renames")?;
+            for line in working.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    paths.insert(PathBuf::from(trimmed));
+                }
+            }
+            // Untracked files (other = untracked, exclude-standard
+            // honors .gitignore).
+            let untracked = git_cmd_read!(
+                &self.dir,
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+            )?;
+            for line in untracked.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    paths.insert(PathBuf::from(trimmed));
+                }
+            }
+        }
+
+        Ok(paths.into_iter().collect())
+    }
 }
 
 fn get_git_version() -> Result<String> {
