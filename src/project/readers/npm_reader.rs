@@ -7,7 +7,8 @@ use serde::Deserialize;
 use super::{is_safe_glob_pattern, read_optional_file};
 use crate::project::ProjectSource;
 use crate::project::reader::{
-    ContributedEdge, ContributedProject, EdgeEndpoint, MonorepoConfigReader, ResolutionView,
+    ContributedEdge, ContributedProject, EdgeEndpoint, MonorepoConfigReader, ReaderContext,
+    ResolutionView,
 };
 
 /// Reads npm/yarn-style workspaces: the root `package.json` `workspaces`
@@ -84,7 +85,7 @@ impl NpmReader {
 
     /// Expand workspace globs, rejecting unsafe patterns (absolute or
     /// `..`) and confirming every match canonicalizes inside the
-    /// monorepo. (F-14)
+    /// monorepo to defend against malicious workspace declarations.
     fn expand_globs(monorepo_root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {
         let canonical_root = monorepo_root
             .canonicalize()
@@ -134,12 +135,14 @@ impl MonorepoConfigReader for NpmReader {
         "npm-workspace"
     }
 
-    fn collect_projects(&self, monorepo_root: &Path) -> Result<Vec<ContributedProject>> {
+    fn collect_projects(&self, ctx: &ReaderContext) -> Result<Vec<ContributedProject>> {
+        let monorepo_root = &ctx.monorepo_root;
         let Some(root_pkg) = Self::read_root(monorepo_root) else {
             return Ok(Vec::new());
         };
         let members =
             Self::expand_globs(monorepo_root, Self::workspace_globs(&root_pkg.workspaces))?;
+        let members = filter_members_by_config_roots(members, ctx);
         let mut out = Vec::new();
         for member in members {
             let pkg = Self::read_member(&member.join("package.json"));
@@ -157,14 +160,16 @@ impl MonorepoConfigReader for NpmReader {
 
     fn collect_edges(
         &self,
-        monorepo_root: &Path,
+        ctx: &ReaderContext,
         view: &ResolutionView,
     ) -> Result<Vec<ContributedEdge>> {
+        let monorepo_root = &ctx.monorepo_root;
         let Some(root_pkg) = Self::read_root(monorepo_root) else {
             return Ok(Vec::new());
         };
         let members =
             Self::expand_globs(monorepo_root, Self::workspace_globs(&root_pkg.workspaces))?;
+        let members = filter_members_by_config_roots(members, ctx);
         let mut out = Vec::new();
         for member in members {
             let Some(pkg) = Self::read_member(&member.join("package.json")) else {
@@ -192,6 +197,25 @@ impl MonorepoConfigReader for NpmReader {
         }
         Ok(out)
     }
+}
+
+/// Drop workspace members that don't sit under any of `ctx.config_roots`.
+/// When `config_roots` is unset, all members are kept (the deprecated
+/// implicit-discovery default).
+fn filter_members_by_config_roots(
+    members: Vec<PathBuf>,
+    ctx: &ReaderContext,
+) -> Vec<PathBuf> {
+    let Some(roots) = ctx.config_roots.as_ref() else {
+        return members;
+    };
+    if roots.is_empty() {
+        return members;
+    }
+    members
+        .into_iter()
+        .filter(|m| roots.iter().any(|r| m.starts_with(r) || m == r))
+        .collect()
 }
 
 #[cfg(test)]

@@ -6,7 +6,8 @@ use serde::Deserialize;
 use super::{DEFAULT_WALK_DEPTH, read_optional_file, walk_for_markers};
 use crate::project::ProjectSource;
 use crate::project::reader::{
-    ContributedEdge, ContributedProject, EdgeEndpoint, MonorepoConfigReader, ResolutionView,
+    ContributedEdge, ContributedProject, EdgeEndpoint, MonorepoConfigReader, ReaderContext,
+    ResolutionView,
 };
 
 /// Reads nx workspace projects: each `project.json` becomes one project,
@@ -54,9 +55,9 @@ impl MonorepoConfigReader for NxReader {
         "nx"
     }
 
-    fn collect_projects(&self, monorepo_root: &Path) -> Result<Vec<ContributedProject>> {
+    fn collect_projects(&self, ctx: &ReaderContext) -> Result<Vec<ContributedProject>> {
         let mut out = Vec::new();
-        for dir in walk_for_markers(monorepo_root, MARKERS, DEFAULT_WALK_DEPTH)? {
+        for dir in walk_for_markers(ctx, MARKERS, DEFAULT_WALK_DEPTH)? {
             let path = dir.join("project.json");
             let Some(parsed) = Self::parse(&path) else {
                 continue;
@@ -78,11 +79,11 @@ impl MonorepoConfigReader for NxReader {
 
     fn collect_edges(
         &self,
-        monorepo_root: &Path,
+        ctx: &ReaderContext,
         _view: &ResolutionView,
     ) -> Result<Vec<ContributedEdge>> {
         let mut out = Vec::new();
-        for dir in walk_for_markers(monorepo_root, MARKERS, DEFAULT_WALK_DEPTH)? {
+        for dir in walk_for_markers(ctx, MARKERS, DEFAULT_WALK_DEPTH)? {
             let path = dir.join("project.json");
             let Some(parsed) = Self::parse(&path) else {
                 continue;
@@ -151,7 +152,8 @@ mod tests {
         .unwrap();
         let graph = crate::project::ProjectGraph::new(tmp.path().to_path_buf());
         let view = ResolutionView::new(&graph);
-        let edges = NxReader.collect_edges(tmp.path(), &view).unwrap();
+        let ctx = ReaderContext::new(tmp.path().to_path_buf(), None);
+        let edges = NxReader.collect_edges(&ctx, &view).unwrap();
         // Only one edge — the negate-prefixed one is skipped.
         assert_eq!(edges.len(), 1);
         match &edges[0].to {

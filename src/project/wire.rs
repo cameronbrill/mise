@@ -35,7 +35,11 @@ pub struct WireProject {
     pub source: ProjectSource,
     pub sources: Vec<String>,
     pub tags: Vec<String>,
-    pub foreign_names: BTreeMap<ProjectSource, String>,
+    /// Per-source foreign names (e.g., the nx `name` or the
+    /// `package.json` `name`). Keys are the kebab-case source identifier
+    /// (`nx`, `npm-workspace`, `pnpm-workspace`, etc.) so JSON consumers
+    /// don't need to understand the `ProjectSource` enum tag form.
+    pub foreign_names: BTreeMap<String, String>,
 }
 
 #[allow(dead_code)]
@@ -55,7 +59,11 @@ impl From<&ProjectGraph> for WireProjectGraph {
                 source: p.source.clone(),
                 sources: p.sources.clone(),
                 tags: p.tags.iter().cloned().collect(),
-                foreign_names: p.foreign_names.clone(),
+                foreign_names: p
+                    .foreign_names
+                    .iter()
+                    .map(|(s, n)| (s.to_string(), n.clone()))
+                    .collect(),
             })
             .collect();
         projects.sort_by(|a, b| a.id.cmp(&b.id));
@@ -91,6 +99,38 @@ mod tests {
         let g = ProjectGraph::new(PathBuf::from("/tmp/mono"));
         let wire: WireProjectGraph = (&g).into();
         assert_eq!(wire.schema, "mise-project-graph-experimental");
+    }
+
+    /// Insta-snapshot of the wire format. Locks the JSON shape so any
+    /// rename/removal of a field surfaces as a PR-time diff rather than
+    /// silently breaking external consumers.
+    #[test]
+    fn wire_format_snapshot() {
+        let mut g = ProjectGraph::new(PathBuf::from("/tmp/mono"));
+        let mut web = Project::new(
+            "//apps/web".into(),
+            PathBuf::from("apps/web"),
+            ProjectSource::Nx,
+        );
+        web.foreign_names
+            .insert(ProjectSource::Nx, "web-shell".into());
+        web.foreign_names
+            .insert(ProjectSource::NpmWorkspace, "@org/web".into());
+        web.sources = vec!["src/**/*.ts".into()];
+        web.tags.insert("frontend".into());
+        g.upsert_project(web);
+        let mut shared = Project::new(
+            "//libs/shared".into(),
+            PathBuf::from("libs/shared"),
+            ProjectSource::NpmWorkspace,
+        );
+        shared
+            .foreign_names
+            .insert(ProjectSource::NpmWorkspace, "@org/shared".into());
+        g.upsert_project(shared);
+        g.add_edge("//apps/web", "//libs/shared");
+        let wire: WireProjectGraph = (&g).into();
+        insta::assert_json_snapshot!(&wire);
     }
 
     #[test]

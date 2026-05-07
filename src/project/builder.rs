@@ -1,9 +1,7 @@
-use std::path::Path;
-
 use eyre::{Result, WrapErr};
 use petgraph::algo::tarjan_scc;
 
-use super::reader::{MonorepoConfigReader, ResolutionView};
+use super::reader::{MonorepoConfigReader, ReaderContext, ResolutionView};
 use super::{Project, ProjectGraph, project_id_from_path};
 
 /// Two-pass orchestrator that walks every registered reader to assemble
@@ -21,20 +19,21 @@ use super::{Project, ProjectGraph, project_id_from_path};
 /// dependency in foreign config is the user's problem to fix and we
 /// still want a renderable graph.
 pub fn build_project_graph(
-    monorepo_root: &Path,
+    ctx: &ReaderContext,
     readers: &[Box<dyn MonorepoConfigReader>],
 ) -> Result<ProjectGraph> {
-    let mut graph = ProjectGraph::new(monorepo_root.to_path_buf());
+    let monorepo_root = &ctx.monorepo_root;
+    let mut graph = ProjectGraph::new(monorepo_root.clone());
 
     // Pass 1 — collect projects.
     for reader in readers {
         let reader_id = reader.id();
         let contributions = reader
-            .collect_projects(monorepo_root)
+            .collect_projects(ctx)
             .with_context(|| format!("project reader '{reader_id}'"))?;
         for contrib in contributions {
             // Reject contributions whose path escapes the monorepo —
-            // produces nonsense ids and pollutes the name_index. (F-32)
+            // produces nonsense ids and pollutes the name_index.
             if contrib.path_root.strip_prefix(monorepo_root).is_err() {
                 warn!(
                     "project reader '{reader_id}' contributed path {} outside monorepo root — skipping",
@@ -53,35 +52,42 @@ pub fn build_project_graph(
         }
     }
 
-    // Pass 2 — collect edges with the populated graph in scope.
-    let snapshot = graph.clone();
-    let view = ResolutionView::new(&snapshot);
-    for reader in readers {
-        let reader_id = reader.id();
-        let edges = reader
-            .collect_edges(monorepo_root, &view)
-            .with_context(|| format!("project reader '{reader_id}' edges"))?;
-        for edge in edges {
-            let (Some(from), Some(to)) = (view.resolve(&edge.from), view.resolve(&edge.to)) else {
-                trace!(
-                    "project reader '{reader_id}': dropped unresolvable edge from={:?} to={:?}",
-                    edge.from, edge.to
-                );
-                continue;
-            };
-            graph.add_edge(&from, &to);
+    // Pass 2 — collect edges into a buffer, then apply. Avoids cloning
+    // the entire graph for an immutable view: edges are accumulated
+    // while `&graph` is borrowed read-only via `ResolutionView`, then
+    // applied via `&mut graph` after the view is dropped.
+    let pending: Vec<(super::ProjectId, super::ProjectId)> = {
+        let view = ResolutionView::new(&graph);
+        let mut acc: Vec<(super::ProjectId, super::ProjectId)> = Vec::new();
+        for reader in readers {
+            let reader_id = reader.id();
+            let edges = reader
+                .collect_edges(ctx, &view)
+                .with_context(|| format!("project reader '{reader_id}' edges"))?;
+            for edge in edges {
+                match (view.resolve(&edge.from), view.resolve(&edge.to)) {
+                    (Some(from), Some(to)) => acc.push((from, to)),
+                    _ => trace!(
+                        "project reader '{reader_id}': dropped unresolvable edge from={:?} to={:?}",
+                        edge.from, edge.to
+                    ),
+                }
+            }
         }
+        acc
+    };
+    for (from, to) in pending {
+        graph.add_edge(&from, &to);
     }
 
-    // Cycles are user-fixable but should be visible. (F-31)
-    if graph.has_cycle() {
-        for component in tarjan_scc(&graph.graph).into_iter().filter(|c| c.len() > 1) {
-            let ids: Vec<&str> = component
-                .iter()
-                .map(|idx| graph.graph[*idx].id.as_str())
-                .collect();
-            warn!("project graph cycle detected among {ids:?}");
-        }
+    // Cycles are user-fixable but should be visible. tarjan_scc itself
+    // detects them — no separate has_cycle call needed.
+    for component in tarjan_scc(&graph.graph).into_iter().filter(|c| c.len() > 1) {
+        let ids: Vec<&str> = component
+            .iter()
+            .map(|idx| graph.graph[*idx].id.as_str())
+            .collect();
+        warn!("project graph cycle detected among {ids:?}");
     }
 
     Ok(graph)
@@ -122,16 +128,20 @@ mod tests {
         fn id(&self) -> &'static str {
             self.id
         }
-        fn collect_projects(&self, _monorepo_root: &Path) -> Result<Vec<ContributedProject>> {
+        fn collect_projects(&self, _ctx: &ReaderContext) -> Result<Vec<ContributedProject>> {
             Ok(self.projects.clone())
         }
         fn collect_edges(
             &self,
-            _monorepo_root: &Path,
+            _ctx: &ReaderContext,
             _view: &ResolutionView,
         ) -> Result<Vec<ContributedEdge>> {
             Ok(self.edges.clone())
         }
+    }
+
+    fn ctx_for(root: &std::path::Path) -> ReaderContext {
+        ReaderContext::new(root.to_path_buf(), None)
     }
 
     #[test]
@@ -169,7 +179,7 @@ mod tests {
         };
         let readers: Vec<Box<dyn MonorepoConfigReader>> =
             vec![Box::new(nx_reader), Box::new(turbo_reader)];
-        let graph = build_project_graph(&monorepo_root, &readers).unwrap();
+        let graph = build_project_graph(&ctx_for(&monorepo_root), &readers).unwrap();
         // Both projects should be present.
         let ids: BTreeSet<String> = graph.projects().map(|p| p.id.clone()).collect();
         assert!(ids.contains("//apps/web"));
@@ -203,7 +213,7 @@ mod tests {
             }],
         };
         let readers: Vec<Box<dyn MonorepoConfigReader>> = vec![Box::new(reader)];
-        let graph = build_project_graph(&monorepo_root, &readers).unwrap();
+        let graph = build_project_graph(&ctx_for(&monorepo_root), &readers).unwrap();
         // No edges should have been added.
         assert_eq!(graph.graph.edge_count(), 0);
     }
@@ -275,7 +285,7 @@ mod tests {
         )
         .unwrap();
 
-        let graph = build_project_graph(root, &default_readers()).unwrap();
+        let graph = build_project_graph(&ctx_for(root), &default_readers()).unwrap();
 
         // All three projects should be present.
         let ids: BTreeSet<String> = graph.projects().map(|p| p.id.clone()).collect();
@@ -347,7 +357,7 @@ mod tests {
         };
         let readers: Vec<Box<dyn MonorepoConfigReader>> =
             vec![Box::new(mise_reader), Box::new(nx_reader)];
-        let graph = build_project_graph(&monorepo_root, &readers).unwrap();
+        let graph = build_project_graph(&ctx_for(&monorepo_root), &readers).unwrap();
         // Single node despite two contributions.
         assert_eq!(graph.graph.node_count(), 1);
         let p = graph.project(&"//apps/web".to_string()).unwrap();

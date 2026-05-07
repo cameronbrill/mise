@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use globset::{Glob, GlobSetBuilder};
 use petgraph::Direction;
 use petgraph::algo::is_cyclic_directed;
@@ -67,7 +67,7 @@ impl ProjectGraph {
 
     /// Insert each `(source, name) -> id` mapping into the name_index,
     /// warning if a different id was previously registered for the same
-    /// key. (F-4) Without this, two projects coincidentally sharing a
+    /// key. Without this, two projects coincidentally sharing a
     /// foreign-format name silently route every cross-reference through
     /// the first-inserted id.
     fn merge_foreign_names(
@@ -152,19 +152,49 @@ impl ProjectGraph {
     ///   - the file lives under `P.root`, AND
     ///   - either `P.sources` is empty, or at least one glob in
     ///     `P.sources` matches the file path relative to `P.root`.
+    ///
+    /// Builds the per-project metadata (absolute root, depth, compiled
+    /// glob set) once before the file loop. The previous shape rebuilt
+    /// these per (file, project) pair which was O(P × F) with allocations.
     pub fn projects_for_changed_files(&self, files: &[PathBuf]) -> Result<BTreeSet<ProjectId>> {
-        let mut out = BTreeSet::new();
-        let mut compiled: HashMap<ProjectId, globset::GlobSet> = HashMap::new();
-        for project in self.projects() {
-            if project.sources.is_empty() {
-                continue;
-            }
-            let mut builder = GlobSetBuilder::new();
-            for pat in &project.sources {
-                builder.add(Glob::new(pat)?);
-            }
-            compiled.insert(project.id.clone(), builder.build()?);
+        struct ProjectMeta<'a> {
+            project: &'a Project,
+            abs_root: PathBuf,
+            depth: usize,
+            globs: Option<globset::GlobSet>,
         }
+        let mut metas: Vec<ProjectMeta<'_>> = Vec::new();
+        for project in self.projects() {
+            let abs_root = if project.root.is_absolute() {
+                project.root.clone()
+            } else {
+                self.monorepo_root.join(&project.root)
+            };
+            let depth = abs_root.components().count();
+            let globs = if project.sources.is_empty() {
+                None
+            } else {
+                let mut builder = GlobSetBuilder::new();
+                for pat in &project.sources {
+                    builder
+                        .add(Glob::new(pat).wrap_err_with(|| {
+                            format!(
+                                "project '{}' has invalid source glob '{pat}'",
+                                project.id
+                            )
+                        })?);
+                }
+                Some(builder.build()?)
+            };
+            metas.push(ProjectMeta {
+                project,
+                abs_root,
+                depth,
+                globs,
+            });
+        }
+
+        let mut out = BTreeSet::new();
         for file in files {
             let abs = if file.is_absolute() {
                 file.clone()
@@ -172,21 +202,16 @@ impl ProjectGraph {
                 self.monorepo_root.join(file)
             };
             let mut best: Option<(usize, &Project)> = None;
-            for project in self.projects() {
-                let project_root = if project.root.is_absolute() {
-                    project.root.clone()
-                } else {
-                    self.monorepo_root.join(&project.root)
+            for meta in &metas {
+                let Ok(rel) = abs.strip_prefix(&meta.abs_root) else {
+                    continue;
                 };
-                if let Ok(rel) = abs.strip_prefix(&project_root) {
-                    let depth = project_root.components().count();
-                    let glob_ok = match compiled.get(&project.id) {
-                        Some(set) => set.is_match(rel),
-                        None => true, // empty sources = match all under root
-                    };
-                    if glob_ok && best.is_none_or(|(d, _)| depth > d) {
-                        best = Some((depth, project));
-                    }
+                let glob_ok = match &meta.globs {
+                    Some(set) => set.is_match(rel),
+                    None => true, // empty sources = match all under root
+                };
+                if glob_ok && best.is_none_or(|(d, _)| meta.depth > d) {
+                    best = Some((meta.depth, meta.project));
                 }
             }
             if let Some((_, p)) = best {

@@ -73,6 +73,7 @@ pub struct Config {
     env_with_sources: OnceCell<EnvWithSources>,
     hooks: OnceCell<Vec<(PathBuf, Hook)>>,
     tasks_cache: Arc<DashMap<crate::task::TaskLoadContext, Arc<BTreeMap<String, Task>>>>,
+    project_graph_cache: OnceCell<Arc<crate::project::ProjectGraph>>,
     tool_request_set: OnceCell<ToolRequestSet>,
     toolset: OnceCell<Toolset>,
     vars_loader: Option<Arc<Config>>,
@@ -149,6 +150,7 @@ impl Config {
             shorthands: get_shorthands(&Settings::get()),
             hooks: OnceCell::new(),
             tasks_cache: Arc::new(DashMap::new()),
+            project_graph_cache: OnceCell::new(),
             tool_request_set: OnceCell::new(),
             toolset: OnceCell::new(),
             all_aliases: Default::default(),
@@ -169,6 +171,7 @@ impl Config {
             shorthands: config.shorthands.clone(),
             hooks: OnceCell::new(),
             tasks_cache: Arc::new(DashMap::new()),
+            project_graph_cache: OnceCell::new(),
             tool_request_set: OnceCell::new(),
             toolset: OnceCell::new(),
             all_aliases: config.all_aliases.clone(),
@@ -424,16 +427,46 @@ impl Config {
     }
 
     /// Build the project graph for the current monorepo. Returns
-    /// `Ok(None)` when there is no monorepo root. The experimental
-    /// gate fires here (and only here) so callers without a monorepo
-    /// don't see the experimental error.
+    /// `Ok(None)` when there is no monorepo root. Cached via
+    /// `project_graph_cache` so multiple callers share the same Arc
+    /// without re-walking the filesystem. The experimental gate fires
+    /// here so callers without a monorepo don't see the error.
     pub fn project_graph(&self) -> Result<Option<Arc<crate::project::ProjectGraph>>> {
         let Some(root) = self.monorepo_root() else {
             return Ok(None);
         };
         Settings::get().ensure_experimental("project-graph")?;
-        let graph = crate::project::build_project_graph(&root, &crate::project::default_readers())?;
-        Ok(Some(Arc::new(graph)))
+        if let Some(cached) = self.project_graph_cache.get() {
+            return Ok(Some(cached.clone()));
+        }
+        let config_roots = self.project_config_roots(&root);
+        let ctx = crate::project::reader::ReaderContext::new(root, config_roots);
+        let graph = crate::project::build_project_graph(&ctx, &crate::project::default_readers())?;
+        let arc = Arc::new(graph);
+        // Best-effort set; if another thread won the race, return their copy.
+        let _ = self.project_graph_cache.set(arc.clone());
+        Ok(Some(arc))
+    }
+
+    /// Expand `[monorepo].config_roots` into absolute paths so the
+    /// project-graph readers can restrict their walks. Returns `None`
+    /// when no `config_roots` are declared (the deprecated implicit-
+    /// discovery path). Errors during glob expansion are warn-logged
+    /// and the default (full walk) is returned.
+    fn project_config_roots(&self, root: &Path) -> Option<Vec<PathBuf>> {
+        let cf = find_monorepo_config(&self.config_files)?;
+        let monorepo = cf.monorepo()?;
+        if monorepo.config_roots.is_empty() {
+            return None;
+        }
+        match expand_config_roots(root, &monorepo.config_roots, None) {
+            Ok(paths) if !paths.is_empty() => Some(paths),
+            Ok(_) => None,
+            Err(e) => {
+                warn!("project-graph: failed to expand [monorepo].config_roots: {e}");
+                None
+            }
+        }
     }
 
     pub async fn tasks(&self) -> Result<Arc<BTreeMap<String, Task>>> {
@@ -2594,6 +2627,7 @@ mod tests {
             shorthands: get_shorthands(&Settings::get()),
             hooks: OnceCell::new(),
             tasks_cache: Arc::new(DashMap::new()),
+            project_graph_cache: OnceCell::new(),
             tool_request_set: OnceCell::new(),
             toolset: OnceCell::new(),
             all_aliases: Default::default(),
@@ -2672,6 +2706,7 @@ mod tests {
             shorthands: get_shorthands(&Settings::get()),
             hooks: OnceCell::new(),
             tasks_cache: Arc::new(DashMap::new()),
+            project_graph_cache: OnceCell::new(),
             tool_request_set: OnceCell::new(),
             toolset: OnceCell::new(),
             all_aliases,
@@ -2735,6 +2770,7 @@ mod tests {
                 shorthands: get_shorthands(&Settings::get()),
                 hooks: OnceCell::new(),
                 tasks_cache: Arc::new(DashMap::new()),
+            project_graph_cache: OnceCell::new(),
                 tool_request_set: OnceCell::new(),
                 toolset: OnceCell::new(),
                 all_aliases,

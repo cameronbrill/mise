@@ -7,7 +7,8 @@ use super::{DEFAULT_WALK_DEPTH, read_optional_file, walk_for_markers};
 use crate::config::config_file::mise_toml::MiseProjectSection;
 use crate::project::ProjectSource;
 use crate::project::reader::{
-    ContributedEdge, ContributedProject, EdgeEndpoint, MonorepoConfigReader, ResolutionView,
+    ContributedEdge, ContributedProject, EdgeEndpoint, MonorepoConfigReader, ReaderContext,
+    ResolutionView,
 };
 
 /// Reads `[project]` tables from `mise.toml` files across the monorepo.
@@ -67,9 +68,9 @@ impl MonorepoConfigReader for MiseReader {
         "mise"
     }
 
-    fn collect_projects(&self, monorepo_root: &Path) -> Result<Vec<ContributedProject>> {
+    fn collect_projects(&self, ctx: &ReaderContext) -> Result<Vec<ContributedProject>> {
         let mut out = Vec::new();
-        for dir in walk_for_markers(monorepo_root, MARKERS, DEFAULT_WALK_DEPTH)? {
+        for dir in walk_for_markers(ctx, MARKERS, DEFAULT_WALK_DEPTH)? {
             let Some(section) = Self::read_section(&dir) else {
                 continue;
             };
@@ -86,11 +87,11 @@ impl MonorepoConfigReader for MiseReader {
 
     fn collect_edges(
         &self,
-        monorepo_root: &Path,
+        ctx: &ReaderContext,
         view: &ResolutionView,
     ) -> Result<Vec<ContributedEdge>> {
         let mut out = Vec::new();
-        for dir in walk_for_markers(monorepo_root, MARKERS, DEFAULT_WALK_DEPTH)? {
+        for dir in walk_for_markers(ctx, MARKERS, DEFAULT_WALK_DEPTH)? {
             let Some(section) = Self::read_section(&dir) else {
                 continue;
             };
@@ -114,7 +115,7 @@ impl MonorepoConfigReader for MiseReader {
                         name: dep.clone(),
                     }
                 } else {
-                    EdgeEndpoint::Path(monorepo_root.join(dep))
+                    EdgeEndpoint::Path(ctx.monorepo_root.join(dep))
                 };
                 out.push(ContributedEdge {
                     from: from.clone(),
