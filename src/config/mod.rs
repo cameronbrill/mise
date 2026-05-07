@@ -2006,85 +2006,17 @@ fn expand_config_roots(
     patterns: &[String],
     ctx: Option<&crate::task::TaskLoadContext>,
 ) -> Result<Vec<PathBuf>> {
-    let mut subdirs = Vec::new();
-
-    for pattern in patterns {
-        // Reject absolute paths and parent directory escapes
-        if pattern.starts_with('/') || pattern.starts_with("..") || pattern.contains("/../") {
-            warn!(
-                "[monorepo] config_roots: '{}' must be a relative path within the monorepo",
-                pattern
-            );
-            continue;
-        }
-
-        // Reject recursive glob patterns (**)
-        if pattern.contains("**") {
-            warn!(
-                "[monorepo] config_roots: recursive glob '**' not supported in '{}', use single-level '*' instead",
-                pattern
-            );
-            continue;
-        }
-
-        if pattern.contains('*') {
-            // Single-level glob expansion
-            let full_pattern = root.join(pattern);
-            match glob::glob(&full_pattern.to_string_lossy()) {
-                Ok(entries) => {
-                    for entry in entries {
-                        match entry {
-                            Ok(path) => {
-                                // Verify path is within monorepo root
-                                if path.strip_prefix(root).is_err() {
-                                    warn!(
-                                        "[monorepo] config_roots: glob matched path outside monorepo root: {}",
-                                        path.display()
-                                    );
-                                    continue;
-                                }
-                                if path.is_dir() && has_mise_config(&path) {
-                                    subdirs.push(path);
-                                }
-                            }
-                            Err(e) => {
-                                warn!("[monorepo] config_roots glob error: {e}");
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("[monorepo] config_roots invalid glob pattern '{pattern}': {e}");
-                }
-            }
+    let mut subdirs = expand_config_roots_inner(root, patterns, |path| {
+        if has_mise_config(path) {
+            true
         } else {
-            // Explicit path
-            let path = root.join(pattern);
-            // Verify path is within monorepo root after resolution
-            if let Ok(canonical) = path.canonicalize()
-                && let Ok(canonical_root) = root.canonicalize()
-                && !canonical.starts_with(&canonical_root)
-            {
-                warn!(
-                    "[monorepo] config_roots: '{}' resolves outside monorepo root",
-                    pattern
-                );
-                continue;
-            }
-            if path.is_dir() {
-                if has_mise_config(&path) {
-                    subdirs.push(path);
-                } else {
-                    warn!(
-                        "[monorepo] config_roots: '{}' has no mise config file",
-                        pattern
-                    );
-                }
-            } else {
-                warn!("[monorepo] config_roots: '{}' does not exist", pattern);
-            }
+            warn!(
+                "[monorepo] config_roots: '{}' has no mise config file",
+                path.display()
+            );
+            false
         }
-    }
+    });
 
     // Apply TaskLoadContext filtering if provided
     if let Some(ctx) = ctx {
@@ -2114,9 +2046,22 @@ fn has_mise_config(dir: &Path) -> bool {
 /// `has_mise_config` filter. Used by the project-graph readers, which
 /// recognize foreign markers (`project.json`, `package.json`,
 /// `pnpm-workspace.yaml`, `turbo.json`) in addition to mise files.
-/// Rejects unsafe patterns (absolute paths, `..` traversal,
-/// recursive `**` globs) and rejects matches that escape `root`.
 fn expand_config_roots_unfiltered(root: &Path, patterns: &[String]) -> Vec<PathBuf> {
+    expand_config_roots_inner(root, patterns, |_| true)
+}
+
+/// Shared core: expand each pattern (single-level glob or explicit
+/// path), reject unsafe forms (absolute, `..`, `**`), filter matched
+/// directories through `keep`, and return a sorted-deduped list.
+///
+/// `keep` runs only on existing directories — non-existent paths are
+/// dropped (the task-system caller separately warn-logs missing
+/// explicit paths via `expand_config_roots`).
+fn expand_config_roots_inner(
+    root: &Path,
+    patterns: &[String],
+    keep: impl Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for pattern in patterns {
         if pattern.starts_with('/') || pattern.starts_with("..") || pattern.contains("/../") {
@@ -2145,7 +2090,7 @@ fn expand_config_roots_unfiltered(root: &Path, patterns: &[String]) -> Vec<PathB
                                     );
                                     continue;
                                 }
-                                if path.is_dir() {
+                                if path.is_dir() && keep(&path) {
                                     out.push(path);
                                 }
                             }
@@ -2159,14 +2104,97 @@ fn expand_config_roots_unfiltered(root: &Path, patterns: &[String]) -> Vec<PathB
             }
         } else {
             let direct_path = root.join(pattern);
+            if let Ok(canonical) = direct_path.canonicalize()
+                && let Ok(canonical_root) = root.canonicalize()
+                && !canonical.starts_with(&canonical_root)
+            {
+                warn!(
+                    "[monorepo] config_roots: '{pattern}' resolves outside monorepo root"
+                );
+                continue;
+            }
             if direct_path.is_dir() {
-                out.push(direct_path);
+                if keep(&direct_path) {
+                    out.push(direct_path);
+                }
+            } else {
+                warn!("[monorepo] config_roots: '{pattern}' does not exist");
             }
         }
     }
     out.sort();
     out.dedup();
     out
+}
+
+#[cfg(test)]
+mod project_config_roots_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_absolute_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = expand_config_roots_unfiltered(tmp.path(), &["/etc/*".into()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn rejects_parent_dir_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = expand_config_roots_unfiltered(tmp.path(), &["../escape".into()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn rejects_recursive_glob() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("apps/web")).unwrap();
+        let result = expand_config_roots_unfiltered(tmp.path(), &["apps/**/*".into()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn expands_single_level_glob() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("apps/web")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("apps/api")).unwrap();
+        let result = expand_config_roots_unfiltered(tmp.path(), &["apps/*".into()]);
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().any(|p| p.ends_with("apps/web")));
+        assert!(result.iter().any(|p| p.ends_with("apps/api")));
+    }
+
+    #[test]
+    fn explicit_path_with_no_mise_config_kept_in_unfiltered() {
+        // The whole point of `_unfiltered` is to admit dirs that don't
+        // have a mise.toml — they may still be valid foreign-format
+        // projects (project.json, package.json, etc.).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("libs/shared")).unwrap();
+        std::fs::write(
+            tmp.path().join("libs/shared/project.json"),
+            r#"{"name":"shared"}"#,
+        )
+        .unwrap();
+        let result = expand_config_roots_unfiltered(tmp.path(), &["libs/shared".into()]);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ends_with("libs/shared"));
+    }
+
+    #[test]
+    fn task_system_filter_drops_no_mise_config_dir() {
+        // Mirror image: the task-system path requires `has_mise_config`,
+        // so the same fixture above must be dropped.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("libs/shared")).unwrap();
+        std::fs::write(
+            tmp.path().join("libs/shared/project.json"),
+            r#"{"name":"shared"}"#,
+        )
+        .unwrap();
+        let result = expand_config_roots(tmp.path(), &["libs/shared".into()], None).unwrap();
+        assert!(result.is_empty());
+    }
 }
 
 fn discover_monorepo_subdirs(
